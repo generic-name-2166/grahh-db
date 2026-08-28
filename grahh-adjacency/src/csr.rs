@@ -71,6 +71,15 @@ impl CsrBuilder {
         Self::default()
     }
 
+    /// Create a builder that already owns a set of `(source, target)` edges.
+    ///
+    /// This takes ownership with **no copying** — useful when a consumer
+    /// already has the edge list (e.g. during a grouped build) and wants to
+    /// hand it to the CSR without an extra allocation.
+    pub fn from_edges(edges: Vec<(NodeId, NodeId)>) -> Self {
+        Self { edges }
+    }
+
     /// Record a directed edge `source -> target` (internal ids).
     pub fn add_edge(&mut self, source: NodeId, target: NodeId) {
         self.edges.push((source, target));
@@ -253,7 +262,6 @@ mod tests {
     #[test]
     fn out_of_range_is_empty() {
         let csr = build_from(&[]);
-        dbg!(&csr);
         assert_eq!(csr.node_count(), 0);
         assert_eq!(csr.edge_count(), 0);
         assert_eq!(csr.degree(0), 0);
