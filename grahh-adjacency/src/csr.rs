@@ -23,9 +23,9 @@
 //! ```
 //! Equal consecutive offsets mean a node has no neighbors — no special case.
 
-use std::range::Range;
+use std::{collections::BTreeMap, range::Range};
 
-use grahh_codecs::{Codec, Plain};
+use grahh_codecs::{Codec, CoreCodec};
 
 /// A dense internal node id: an index into the node store, also used to index
 /// into this CSR's offset array. Dense (no gaps) by renumbering, so the offset
@@ -153,7 +153,7 @@ impl ChunkedCsr {
             let slice: &[u64] = &neighbors[pos..end];
 
             let mut packed: Vec<u8> = Vec::new();
-            Plain.encode(slice, &mut packed).unwrap();
+            CoreCodec.encode(slice, &mut packed).unwrap();
 
             chunks.push(Chunk {
                 len: slice.len(),
@@ -176,6 +176,27 @@ impl ChunkedCsr {
     /// Total number of stored neighbor entries (edges) in this store.
     pub fn edge_count(&self) -> usize {
         self.offsets.last().copied().unwrap_or_default()
+    }
+
+    /// Total encoded size of this store in bytes: the offsets array plus every
+    /// compressed chunk payload (each chunk includes its 1-byte format tag).
+    pub fn encoded_size(&self) -> usize {
+        let offsets_bytes = self.offsets.len() * size_of::<usize>();
+        let chunks_bytes: usize = self.neighbors.iter().map(|c| c.packed.len()).sum();
+        offsets_bytes + chunks_bytes
+    }
+
+    /// Per-format usage: how many chunks were compressed by each format and
+    /// how many bytes they occupy. Reads the tag byte from each chunk.
+    pub fn format_usage(&self) -> Vec<(&'static str, usize, usize)> {
+        let mut usage: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+        for c in self.neighbors.iter() {
+            let name = grahh_codecs::format_name(&c.packed).unwrap_or("?");
+            let e = usage.entry(name).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += c.packed.len();
+        }
+        usage.into_iter().map(|(k, (n, b))| (k, n, b)).collect()
     }
 
     /// The slice range `[start, end)` of `node`'s neighbors in the flat
@@ -226,7 +247,7 @@ impl ChunkedCsr {
             let hi: usize = range.end.min(cend);
 
             decoded.clear();
-            Plain.decode(&chunk.packed, &mut decoded).unwrap();
+            CoreCodec.decode(&chunk.packed, &mut decoded).unwrap();
 
             out.extend_from_slice(&decoded[lo - cstart..hi - cstart]);
         }

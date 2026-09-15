@@ -1,4 +1,4 @@
-//! Traversal benchmark: chunked CSR (plain storage) vs a naive adjacency list.
+//! Traversal benchmark: chunked CSR vs a naive adjacency list.
 //!
 //! Validates the "index-free adjacency" premise: does a compressed, chunked
 //! CSR give fast neighbor expansion and nested traversal versus the naive
@@ -7,10 +7,10 @@
 //! Run: `cargo run --release --example bench_traversal`
 //!
 //! Deliberately dependency-free: timing is raw `std::time::Instant`, and the
-//! naive and CSR stores are both built from the same synthetic graph. No
-//! codec-selection heuristics — the CSR compresses each chunk with the plain
-//! codec on purpose, so we measure the cost of the *chunked CSR structure*
-//! itself, not any compression cleverness.
+//! naive and CSR stores are both built from the same synthetic graph. The CSR
+//! compresses each chunk with the library's codec picker (best of
+//! FOR/bitpack/RLE/plain), and we report the real encoded size + which format
+//! won per chunk.
 
 use std::time::{Duration, Instant};
 
@@ -85,22 +85,24 @@ fn main() {
 
     println!("build naive: {t_naive:?} | build csr: {t_csr:?}");
 
-    // ---- Footprint comparison (estimated) ----
+    // ---- Footprint comparison (measured) ----
     // naive: 8 bytes per neighbor id.
     let naive_bytes: usize = naive.iter().map(|v| v.len() * 8).sum::<usize>();
-    // CSR: offsets (8 B/node) + plain-encoded chunks. Each chunk runs 64 ids
-    // at 8 B each, plus a 4 B count header. ChunkedCsr keeps these internal,
-    // so we estimate with the known constants. This is approximate.
-    let chunks_est: usize = ((csr.edge_count() as f64) / 64.0).ceil() as usize;
-    let csr_est: usize = (csr.node_count().saturating_add(1)) * 8 + chunks_est * (64 * 8 + 4);
+    // CSR: real encoded size from the store itself (offsets + compressed chunks).
+    let csr_bytes: usize = csr.encoded_size();
     println!(
-        "footprint naive ~ {naive_bytes} B ~ {:.1} MiB",
+        "footprint naive   ~ {naive_bytes} B ~ {:.1} MiB",
         naive_bytes as f64 / (1024.0 * 1024.0)
     );
     println!(
-        "footprint csr   ~ {csr_est} B ~ {:.1} MiB (plain chunks)",
-        csr_est as f64 / (1024.0 * 1024.0)
+        "footprint csr     ~ {csr_bytes} B ~ {:.1} MiB",
+        csr_bytes as f64 / (1024.0 * 1024.0)
     );
+    println!(
+        "csr compression   ~ {:.2}x smaller than naive",
+        naive_bytes as f64 / csr_bytes.max(1) as f64
+    );
+    println!("csr format usage : {:?}", csr.format_usage());
 
     // ---- Measurement helpers ----
     // Single-hop expansion from a node (sum neighbor ids so work is real).

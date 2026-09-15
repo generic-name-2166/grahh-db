@@ -1,34 +1,37 @@
-//! Fixed-width bit-packing codec.
+//! Fixed-width bit-packing format.
 //!
 //! A column of `u64` values is stored using only as many bits per value as it
 //! actually needs (its *required width*), instead of a full 8 bytes.
-//!
-//! Buffer layout:
+//! Payload (after the tag byte):
 //!
 //! ```text
 //! [ count : u32 LE ][ width : u8 ][ values : bit-packed, `count` entries of `width` bits ]
 //! ```
 //!
-//! The value `width == 0` denotes an all-zero column: the three header bytes
-//! fit in the same 5-byte header and there are no data bytes because an empty
-//! column *and* an all-zero column both round-trip correctly at width 0.
+//! `width == 0` denotes an all-zero column: there are no data bytes because an
+//! empty column and an all-zero column both round-trip at width 0.
 
-use crate::{Codec, CodecError};
+use crate::{sink::ByteSink, CodecError};
 
-/// Largest width (in *bits*) this module can address.
-///
-/// size of `u64`
+/// Largest width (in *bits*) this module can address (one `u64`).
 const MAX_WIDTH: u32 = 64;
 /// number of bits in a byte
 const BYTE_SIZE: usize = 8;
 const HEADER_BYTES: usize = size_of::<u32>() + size_of::<u8>();
 
-fn write_header(count: usize, width: u32, out: &mut Vec<u8>) {
-    out.extend_from_slice(&(count as u32).to_le_bytes());
-    out.push(width as u8);
+/// The parsed bit-packed header: how many values, at what bit-width.
+#[derive(Debug, Clone, Copy)]
+struct Header {
+    count: usize,
+    width: u32,
 }
 
-fn read_header(bytes: &[u8]) -> Result<(usize, u32), CodecError> {
+fn write_header(header: Header, sink: &mut impl ByteSink) {
+    sink.write_u32(header.count as u32);
+    sink.write_u8(header.width as u8);
+}
+
+fn read_header(bytes: &[u8]) -> Result<Header, CodecError> {
     if bytes.len() < HEADER_BYTES {
         return Err(CodecError::Truncated);
     }
@@ -37,11 +40,11 @@ fn read_header(bytes: &[u8]) -> Result<(usize, u32), CodecError> {
     if width > MAX_WIDTH {
         return Err(CodecError::Corrupt);
     }
-    Ok((count, width))
+    Ok(Header { count, width })
 }
 
 /// Number of bytes produced by packing `count` values of `width` bits.
-fn unpacked_size(count: usize, width: u32) -> usize {
+pub(crate) fn unpacked_size(count: usize, width: u32) -> usize {
     if width == 0 {
         0
     } else {
@@ -61,17 +64,16 @@ fn required_width(max_value: u64) -> u32 {
     }
 }
 
-/// Pack `values` at `width` bits each, appending packed bytes to `out`.
+/// Pack `values` at `width` bits each, writing to `sink`.
 ///
 /// `width` must be `<= 64`. A `width == 64` column is stored verbatim as
-/// little-endian `u64`; a `width == 0` column (all values zero) appends
+/// little-endian `u64`; a `width == 0` column (all values zero) writes
 /// nothing. Inverse is [`unpack`].
-fn pack(values: &[u64], width: u32, out: &mut Vec<u8>) {
+pub(crate) fn pack(values: &[u64], width: u32, sink: &mut impl ByteSink) {
     debug_assert!(width <= MAX_WIDTH);
     if width == MAX_WIDTH {
-        out.reserve(values.len() * 8);
         for &v in values {
-            out.extend_from_slice(&v.to_le_bytes());
+            sink.write_u64(v);
         }
         return;
     }
@@ -82,20 +84,20 @@ fn pack(values: &[u64], width: u32, out: &mut Vec<u8>) {
         bitbuf |= ((value & mask) as u128) << bits;
         bits += width;
         while bits >= 8 {
-            out.push((bitbuf & 0xff) as u8);
+            sink.write_u8((bitbuf & 0xff) as u8);
             bitbuf >>= 8;
             bits -= 8;
         }
     }
     if bits > 0 {
-        out.push((bitbuf & 0xff) as u8);
+        sink.write_u8((bitbuf & 0xff) as u8);
     }
 }
 
 /// Unpack `count` values of `width` bits each from `bytes`, appending to `out`.
 ///
 /// Inverse of [`pack`]. `bytes` must contain at least [`unpacked_size`] bytes.
-fn unpack(bytes: &[u8], width: u32, count: usize, out: &mut Vec<u64>) {
+pub(crate) fn unpack(bytes: &[u8], width: u32, count: usize, out: &mut Vec<u64>) {
     debug_assert!(width <= MAX_WIDTH);
     if width == 64 {
         for c in 0..count {
@@ -124,43 +126,42 @@ fn unpack(bytes: &[u8], width: u32, count: usize, out: &mut Vec<u64>) {
     }
 }
 
-/// Fixed-width bit-packing codec.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Bitpack;
+/// Encode `values` into `sink` as a bit-packed payload (excluding the tag,
+/// which the caller writes).
+pub(crate) fn encode_u64(values: &[u64], sink: &mut impl ByteSink) {
+    let max: u64 = values.iter().max().map_or(0, |v: &u64| *v);
+    let header = Header {
+        count: values.len(),
+        width: required_width(max),
+    };
+    write_header(header, sink);
+    pack(values, header.width, sink);
+}
 
-impl Codec<u64> for Bitpack {
-    fn encode(&self, values: &[u64], out: &mut Vec<u8>) -> Result<(), CodecError> {
-        let max: u64 = values.iter().max().map_or(0, |v: &u64| *v);
-        let width: u32 = required_width(max);
-        write_header(values.len(), width, out);
-        pack(values, width, out);
-        Ok(())
+/// Decode a bit-packed payload into `out`.
+pub(crate) fn decode_u64(
+    bytes: &[u8],
+    out: &mut Vec<u64>,
+) -> Result<(), CodecError> {
+    let header = read_header(bytes)?;
+    if bytes.len() < HEADER_BYTES + unpacked_size(header.count, header.width) {
+        return Err(CodecError::Truncated);
     }
-
-    fn decode(&self, bytes: &[u8], out: &mut Vec<u64>) -> Result<(), CodecError> {
-        let (count, width) = read_header(bytes)?;
-        if bytes.len() < unpacked_size(count, width) {
-            return Err(CodecError::Truncated);
-        }
-        unpack(&bytes[5..], width, count, out);
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "bitpack"
-    }
+    unpack(&bytes[HEADER_BYTES..], header.width, header.count, out);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::sink::VecSink;
     use super::*;
-    use crate::Codec;
 
     fn roundtrip(values: &[u64]) {
         let mut buf = Vec::new();
-        Bitpack.encode(values, &mut buf).unwrap();
+        let mut sink = VecSink::new(&mut buf);
+        encode_u64(values, &mut sink);
         let mut out = Vec::new();
-        Bitpack.decode(&buf, &mut out).unwrap();
+        decode_u64(&buf, &mut out).unwrap();
         assert_eq!(out, values);
     }
 
@@ -179,27 +180,28 @@ mod tests {
     #[test]
     fn header_reflects_width_and_count() {
         let mut buf = Vec::new();
-        Bitpack.encode(&[1, 2, 3], &mut buf).unwrap();
+        let mut sink = VecSink::new(&mut buf);
+        encode_u64(&[1, 2, 3], &mut sink);
         // count=3, width=2 bits (max 3).
-        let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        assert_eq!(count, 3);
+        assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), 3);
         assert_eq!(buf[4], 2);
     }
 
     #[test]
     fn corrupt_width_is_rejected() {
         let mut buf = Vec::new();
-        Bitpack.encode(&[1, 2], &mut buf).unwrap();
+        let mut sink = VecSink::new(&mut buf);
+        encode_u64(&[1, 2], &mut sink);
         buf[4] = 200; // impossible width > 64
         let mut out = Vec::new();
-        assert_eq!(Bitpack.decode(&buf, &mut out), Err(CodecError::Corrupt));
+        assert_eq!(decode_u64(&buf, &mut out), Err(CodecError::Corrupt));
     }
 
     #[test]
     fn truncated_buffer_is_rejected() {
         let mut out = Vec::new();
         assert_eq!(
-            Bitpack.decode(&[1, 2, 3], &mut out),
+            decode_u64(&[1, 2, 3], &mut out),
             Err(CodecError::Truncated)
         );
     }

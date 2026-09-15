@@ -1,96 +1,85 @@
-//! Columnar compression codecs for GRAHH-DB.
+//! Columnar compression for GRAHH-DB.
 //!
-//! This crate defines the *thin, uniform codec seam* that every storage layer
-//! below depends on. A [`Codec`] turns a homogeneous column of values into a
-//! self-describing byte buffer and back. Because a codec's output carries
-//! everything its decoder needs (element count, layout parameters), callers
-//! treat codecs as interchangeable black boxes — the engine depends on the
-//! trait, never on a codec's internals.
+//! The public surface is deliberately small and opaque: a [`Codec<T>`] trait
+//! (per column type `T`) and the singular [`CoreCodec`] that implements it.
+//! Callers do `encode`/`decode` against `&dyn Codec<T>` (or `CoreCodec`) and
+//! never choose or inspect the underlying format.
 //!
-//! Codecs in this crate:
+//! Internally, [`CoreCodec`] probes a set of *formats* — delta/FOR,
+//! bit-packing, RLE, plain — with a counting sink, picks the smallest, and
+//! writes a self-describing 1-byte tag so decoding needs no prior knowledge.
 //!
-//! | codec | struct | behaviour | notes |
-//! |-------|--------|-----------|-------|
-//! | plain | [`Plain`] | raw passthrough | the no-op; also the size fallback |
-//! | bitpack | [`Bitpack`] | fixed-width bit-packing | great for bounded integers |
-//! | rle | [`Rle`] | run-length encoding | great for long repeated runs |
-//!
-//! Adding a future codec (frame-of-reference, dictionary, front-coding,
-//! enum, ...) is just a new module with a single `impl Codec<T>` — no changes
-//! to the existing codecs or to the layers that consume them.
+//! The *format* set is open (add a format + register its tag in
+//! [`crate::format`]); the *public* API is closed. Callers cannot register
+//! user codecs.
 
 mod bitpack;
+mod codec;
+mod for_;
+mod format;
 mod plain;
 mod rle;
+mod sink;
 
-pub use crate::{bitpack::Bitpack, plain::Plain, rle::Rle};
+pub use codec::{Codec, CoreCodec};
 
-/// Error conditions surfaced by any [`Codec`] while decoding.
+/// Error conditions surfaced by any codec while encoding/decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecError {
     /// The byte buffer is shorter than its header/layout declares.
     Truncated,
-    /// The header is internally inconsistent (impossible width/count).
+    /// The header is internally inconsistent (impossible width/count/tag).
     Corrupt,
     /// The recovered value overflows the expected type during decoding.
     Overflow,
 }
 
-/// A columnar compression codec: a homogeneous column `&[T]` <-> a
-/// self-describing byte buffer.
-///
-/// The buffer written by [`encode`](Codec::encode) carries everything
-/// [`decode`](Codec::decode) needs to reconstruct the column, so callers
-/// never reach into a codec's internals. This is what lets new codecs slot in
-/// without touching the engine.
-pub trait Codec<T> {
-    /// Encode `values`, appending the self-describing buffer to `out`.
-    ///
-    /// `out` is appended to (not reset) so multiple columns can be written
-    /// into one shared buffer during chunk assembly. If `out` already has
-    /// data, the encoder's bytes are pushed after it.
-    fn encode(&self, values: &[T], out: &mut Vec<u8>) -> Result<(), CodecError>;
-
-    /// Decode the entire `bytes` buffer back into `out`.
-    ///
-    /// Reads exactly one self-describing codec buffer from `bytes`. Any
-    /// trailing bytes (e.g. a later column in a shared chunk buffer) are
-    /// ignored.
-    fn decode(&self, bytes: &[u8], out: &mut Vec<T>) -> Result<(), CodecError>;
-
-    /// Stable name used in chunk headers and for debug/selection.
-    fn name(&self) -> &'static str;
+/// Read the format tag out of an encoded buffer's leading byte and map it to a
+/// stable human-readable name (for diagnostics, tests, and debugging).
+pub fn format_name(bytes: &[u8]) -> Option<&'static str> {
+    match *bytes.first()? {
+        format::TAG_FOR => Some("for"),
+        format::TAG_BITPACK => Some("bitpack"),
+        format::TAG_RLE => Some("rle"),
+        format::TAG_PLAIN => Some("plain"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
-mod codec_contract_tests {
+mod contract_tests {
     use super::*;
 
-    /// A column whose every value is representable in `w` bits round-trips
-    /// through every codec in the crate behind a single `&dyn Codec<u64>`.
+    /// Drive any per-type codec behind `&dyn Codec<u64>`.
     fn roundtrip_via_dyn(codec: &dyn Codec<u64>, values: &[u64]) {
         let mut buf = Vec::new();
         codec.encode(values, &mut buf).unwrap();
         let mut out = Vec::new();
         codec.decode(&buf, &mut out).unwrap();
-        assert_eq!(out, values, "codec '{}' broke roundtrip", codec.name());
+        assert_eq!(out, values);
     }
 
     #[test]
-    fn all_codecs_are_swappable_behind_the_trait() {
-        let codecs: Vec<&dyn Codec<u64>> = vec![&Plain, &Bitpack, &Rle];
-        let columns = [
-            &[][..],
-            &[0][..],
+    fn core_codec_roundtrips_behind_the_trait() {
+        let c: CoreCodec = CoreCodec;
+        let columns: &[&[u64]] = &[
+            &[],
+            &[0],
             &[0, 0, 0, 0],
             &[1, 2, 3],
             &[0, u64::MAX],
+            &[3, 3, 5, 5, 5, 2, 2],
             &[1, 2, 2, 3, 0, 0, 0, 4],
         ];
-        for codec in &codecs {
-            for column in &columns {
-                roundtrip_via_dyn(*codec, column);
-            }
+        for column in columns {
+            roundtrip_via_dyn(&c, column);
         }
+    }
+
+    #[test]
+    fn unknown_tag_is_corrupt() {
+        let mut out = Vec::new();
+        // tag 0xFF not registered
+        assert_eq!(CoreCodec.decode(&[0xff, 0, 0, 0, 0], &mut out), Err(CodecError::Corrupt));
     }
 }
