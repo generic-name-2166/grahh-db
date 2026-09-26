@@ -20,7 +20,10 @@
 //! assert_eq!(got, [1, 1, 1, 5]);
 //! ```
 
-use crate::{bitpack, for_, format, plain, rle, sink::{ByteSink, CountingSink, VecSink}, CodecError};
+use crate::{
+    CodecError, bitpack, for_, format, plain, rle,
+    sink::{ByteSink, CountingSink, VecSink},
+};
 
 /// A columnar codec: a homogeneous column `&[T]` <-> a self-describing byte
 /// buffer (leading tag byte + format payload). Callers treat it as opaque —

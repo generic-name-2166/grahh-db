@@ -8,7 +8,7 @@
 //!
 //! A 1-byte tag is plenty: `decode` for a given `T` already knows the type, so
 //! the tag only needs to distinguish the handful of formats valid for that
-//! type. 
+//! type.
 //!
 //! In this staged implementation the four formats below are the whole u64 tag
 //! space. When string/enum types arrive they bring their own tag spaces.
@@ -26,10 +26,7 @@ pub(crate) const TAG_PLAIN: u8 = 3;
 
 /// Dispatch a `u64` payload (after its tag byte) to the matching format's
 /// decoder.
-pub(crate) fn dispatch_decode_u64(
-    bytes: &[u8],
-    out: &mut Vec<u64>,
-) -> Result<(), CodecError> {
+pub(crate) fn dispatch_decode_u64(bytes: &[u8], out: &mut Vec<u64>) -> Result<(), CodecError> {
     if bytes.is_empty() {
         return Err(CodecError::Truncated);
     }

@@ -80,6 +80,9 @@ mod contract_tests {
     fn unknown_tag_is_corrupt() {
         let mut out = Vec::new();
         // tag 0xFF not registered
-        assert_eq!(CoreCodec.decode(&[0xff, 0, 0, 0, 0], &mut out), Err(CodecError::Corrupt));
+        assert_eq!(
+            CoreCodec.decode(&[0xff, 0, 0, 0, 0], &mut out),
+            Err(CodecError::Corrupt)
+        );
     }
 }

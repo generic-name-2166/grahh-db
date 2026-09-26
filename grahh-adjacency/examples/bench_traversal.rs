@@ -109,7 +109,11 @@ fn main() {
     let mut sink: usize = 0;
 
     fn expand_sum(csr: &ChunkedCsr, node: NodeId) -> usize {
-        csr.neighbors(node).iter().copied().map(|n| n as usize).sum()
+        csr.neighbors(node)
+            .iter()
+            .copied()
+            .map(|n| n as usize)
+            .sum()
     }
     fn expand_sum_naive(naive: &[Vec<NodeId>], node: NodeId) -> usize {
         naive

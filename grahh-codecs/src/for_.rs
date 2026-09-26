@@ -13,7 +13,11 @@
 //!
 //! `width == 0` (all deltas zero, i.e. every value equal) stores no gap bytes.
 
-use crate::{bitpack::{pack, unpack, unpacked_size}, sink::ByteSink, CodecError};
+use crate::{
+    CodecError,
+    bitpack::{pack, unpack, unpacked_size},
+    sink::ByteSink,
+};
 
 fn required_gap_width(max_gap: u64) -> u32 {
     if max_gap == 0 {
@@ -26,7 +30,10 @@ fn required_gap_width(max_gap: u64) -> u32 {
 /// Encode `values` into `sink` as FOR (payload only). Requires non-decreasing
 /// input; deltas underflow for decreasing input.
 pub(crate) fn encode_u64(values: &[u64], sink: &mut impl ByteSink) {
-    assert!(!values.is_empty(), "FOR needs a reference value for an empty column");
+    assert!(
+        !values.is_empty(),
+        "FOR needs a reference value for an empty column"
+    );
 
     let first: u64 = values[0];
     let mut gaps: Vec<u64> = Vec::with_capacity(values.len() - 1);
@@ -42,10 +49,7 @@ pub(crate) fn encode_u64(values: &[u64], sink: &mut impl ByteSink) {
 }
 
 /// Decode a FOR payload into `out`.
-pub(crate) fn decode_u64(
-    bytes: &[u8],
-    out: &mut Vec<u64>,
-) -> Result<(), CodecError> {
+pub(crate) fn decode_u64(bytes: &[u8], out: &mut Vec<u64>) -> Result<(), CodecError> {
     // header: count u32, width u8, first u64, then packed gaps
     const HEADER_BYTES: usize = size_of::<u32>() + size_of::<u8>() + size_of::<u64>();
     if bytes.len() < HEADER_BYTES {
@@ -54,14 +58,7 @@ pub(crate) fn decode_u64(
     let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     let width: u32 = bytes[4] as u32;
     let first = u64::from_le_bytes([
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
+        bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
     ]);
     if width > 64 {
         return Err(CodecError::Corrupt);
@@ -89,8 +86,8 @@ pub(crate) fn decode_u64(
 
 #[cfg(test)]
 mod tests {
-    use crate::sink::VecSink;
     use super::*;
+    use crate::sink::VecSink;
 
     fn roundtrip(values: &[u64]) {
         let mut buf = Vec::new();

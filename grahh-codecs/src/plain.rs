@@ -7,7 +7,7 @@
 //! [ count : u32 LE ][ value : u64 LE ]×count
 //! ```
 
-use crate::{sink::ByteSink, CodecError};
+use crate::{CodecError, sink::ByteSink};
 
 const HEADER_BYTES: usize = size_of::<u32>();
 
@@ -50,8 +50,8 @@ pub(crate) fn decode_u64(bytes: &[u8], out: &mut Vec<u64>) -> Result<(), CodecEr
 
 #[cfg(test)]
 mod tests {
-    use crate::sink::VecSink;
     use super::*;
+    use crate::sink::VecSink;
 
     fn roundtrip(values: &[u64]) {
         let mut buf = Vec::new();

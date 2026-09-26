@@ -15,7 +15,7 @@
 //! The *worst* case (every value distinct) is larger than the plain format, so
 //! RLE only wins when it actually reduces size — which the codec picker decides.
 
-use crate::{sink::ByteSink, CodecError};
+use crate::{CodecError, sink::ByteSink};
 
 const HEADER_BYTES: usize = size_of::<u32>() * 2;
 const RUN_BYTES: usize = size_of::<u64>() + size_of::<u32>();
@@ -40,10 +40,7 @@ pub(crate) fn encode_u64(values: &[u64], sink: &mut impl ByteSink) {
 }
 
 /// Decode an RLE payload into `out`.
-pub(crate) fn decode_u64(
-    bytes: &[u8],
-    out: &mut Vec<u64>,
-) -> Result<(), CodecError> {
+pub(crate) fn decode_u64(bytes: &[u8], out: &mut Vec<u64>) -> Result<(), CodecError> {
     if bytes.len() < HEADER_BYTES {
         return Err(CodecError::Truncated);
     }
@@ -95,8 +92,8 @@ fn encode_runs(values: &[u64]) -> Vec<(u64, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use crate::sink::VecSink;
     use super::*;
+    use crate::sink::VecSink;
 
     fn roundtrip(values: &[u64]) {
         let mut buf = Vec::new();

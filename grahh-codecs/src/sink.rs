@@ -93,6 +93,11 @@ mod tests {
         counting.write_u8(1);
 
         assert_eq!(counting.count(), real.len());
-        assert_eq!(real, vec![7, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1]);
+        assert_eq!(
+            real,
+            vec![
+                7, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1
+            ]
+        );
     }
 }

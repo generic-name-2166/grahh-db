@@ -11,7 +11,7 @@
 //! `width == 0` denotes an all-zero column: there are no data bytes because an
 //! empty column and an all-zero column both round-trip at width 0.
 
-use crate::{sink::ByteSink, CodecError};
+use crate::{CodecError, sink::ByteSink};
 
 /// Largest width (in *bits*) this module can address (one `u64`).
 const MAX_WIDTH: u32 = 64;
@@ -139,10 +139,7 @@ pub(crate) fn encode_u64(values: &[u64], sink: &mut impl ByteSink) {
 }
 
 /// Decode a bit-packed payload into `out`.
-pub(crate) fn decode_u64(
-    bytes: &[u8],
-    out: &mut Vec<u64>,
-) -> Result<(), CodecError> {
+pub(crate) fn decode_u64(bytes: &[u8], out: &mut Vec<u64>) -> Result<(), CodecError> {
     let header = read_header(bytes)?;
     if bytes.len() < HEADER_BYTES + unpacked_size(header.count, header.width) {
         return Err(CodecError::Truncated);
@@ -153,8 +150,8 @@ pub(crate) fn decode_u64(
 
 #[cfg(test)]
 mod tests {
-    use crate::sink::VecSink;
     use super::*;
+    use crate::sink::VecSink;
 
     fn roundtrip(values: &[u64]) {
         let mut buf = Vec::new();
@@ -200,9 +197,6 @@ mod tests {
     #[test]
     fn truncated_buffer_is_rejected() {
         let mut out = Vec::new();
-        assert_eq!(
-            decode_u64(&[1, 2, 3], &mut out),
-            Err(CodecError::Truncated)
-        );
+        assert_eq!(decode_u64(&[1, 2, 3], &mut out), Err(CodecError::Truncated));
     }
 }
