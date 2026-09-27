@@ -32,16 +32,19 @@ Three sub-claims to validate with numbers, in order:
 
 | Phase | Scope | Status |
 |---|---|---|
-| 0 | Type model + format spec | Decisions made (see §4); being written up here |
+| 0 | Type model + format spec | Decisions made (see §4); captured in this doc |
 | 1 | Codec layer | ✅ `grahh-codecs` — trait, formats, picker |
 | 2 | Chunked CSR adjacency | ✅ `grahh-adjacency` — `ChunkedCsr` + registry |
-| 3 | Traversal/compression benchmark | ✅ `bench_traversal`|
-| 4 | Schema/type-model crate | ⏳ later |
-| 5 | Persistence (mmap / WAL / compaction) | ⏳ later |
+| 3 | Traversal/compression benchmark | ✅ `bench_traversal` |
+| 4 | Persistence: serializable byte format | 🔄 4a done (byte format + validation); 4b/4c later |
+| 5 | Codegen / type-model crate | ⏳ later (unlocks typed property stores) |
 | 6 | Query surface (primitives + language) | ⏳ later |
 
-MVP gate: **Phase 4 + a join**, so the headline query works end-to-end from
-one embedded file.
+MVP gate: **Persistence (Phase 4)**, so the adjacency store round-trips
+through a stable byte format. The headline nested query also needs the
+property store, which was **removed pending codegen** (see §7): a
+self-contained heterogeneous column store forces type erasure (rejected at the
+API), and without codegen a "store" degenerates to a bare `Vec` wrapper.
 
 ---
 
@@ -60,6 +63,7 @@ Build/test:
 cargo test -p grahh-codecs
 cargo test -p grahh-adjacency
 cargo run --release --example bench_traversal -p grahh-adjacency
+cargo run --release --example bench_persistence -p grahh-adjacency
 cargo clippy --workspace --all-targets
 ```
 
@@ -145,35 +149,54 @@ friends-of-friends: csr ~3.0 µs | naive ~0.31 µs    (~10x slower)
 
 ---
 
-## 6. Next step — Phase 4: columnar property store
+## 6. Next step — Phase 4: persistence (serialization first)
 
-Goal: make the *other half* of the headline query real —
-`expand(A, friends) -> friend ids -> project(name, age)`.
+The storage layer is done (codecs + chunked CSR registry); before it can be
+called a database it must survive process restarts. Persistence is staged:
 
-Proposed shape (subject to refinement):
-- **Typed property columns:** per `NodeKind`, one column per property; each
-  column is a `Vec` of typed values (or nulls) compressed by the codec picker.
-  Keep the graph-sparse reality — not every node has every property.
-- **Projection primitive:** `project(node_ids, [prop list]) -> typed values`,
-  only decompressing requested columns (the DuckDB-style projection win).
-- **Join with adjacency:** `expand` + `project` compose into the headline query.
-- **Edge store:** stateful edge payloads keyed by edge id, columnar.
-- **Schema descriptor** (`NodeKind`/`EdgeKind` registry) becomes first-class
-  metadata — this is also the seam for future codegen.
+**4a — serializable byte format (done).** Both `ChunkedCsr` and
+`AdjacencyStore` round-trip losslessly through a self-describing, fixed-width,
+little-endian byte stream (`Vec<u8>` in and out). Rules:
+- **Fixed-width integers everywhere** — offsets/counts are `u64` LE, never
+  `usize` (architecture-dependent), so files are portable.
+- **Length-prefixed, self-delimiting** regions, so a reader never guesses
+  where a chunk or blob ends and unknown regions are skippable.
+- **The data describes itself**, chunk geometry included: the region records
+  how many flat positions a chunk spans and the reader uses that, rather than
+  assuming a compiled-in constant.
+- Chunk payloads are written **verbatim** (they already carry their codec tag),
+  so persisting is a copy, never a recompression — the first real claim on
+  "on disk == in RAM".
+- The header's **version field is data, not behaviour**: it says which layout
+  the bytes are in. It is `0` (pre-1.0 — unstable, nothing promised). A layout
+  change is handled by a separate migration tool that reads an old structure
+  from scratch, not by branching inside this reader.
+- **Validate at connect time, then trust**: structural checks (magic, version,
+  geometry, monotonic offsets, counts, no trailing bytes) *and* every chunk
+  payload (decodes, produces the declared id count, targets in order). There is
+  no unchecked load path; after a load, decoding has no failure path left.
+- Cost and size of all this, plus the copy-vs-recompress claim, are measured:
+  `cargo run --release --example bench_persistence`.
 
-Evaluation gate: a new/updated benchmark that measures the end-to-end
-"friends + their name/age" query on a realistic graph.
+**4b — file + mmap (deferred).** This std exposes no `std::fs`/`File`/`mmap`
+anywhere yet; real disk I/O and memory-mapped reads land once we confirm the
+primitive exists. The byte format is the file format, so 4b is a thin layer on
+top of 4a.
+
+**4c — WAL / compaction / renumbering (even later).** Write-path concerns,
+not needed until there are in-place mutations.
 
 ---
 
 ## 7. Later phases
 
-- **Phase 5 — schema/type-model crate:** formal `NodeKind`/`EdgeKind`/`Enum`
-  types, property catalog, label index. Feeds codegen later.
-- **Phase 6 — persistence:** serializable chunk format, mmap the compressed
-  base ("on disk == in RAM"), WAL + memtable + eager compaction with dense
-  renumbering.
-- **Phase 7 — query surface:** materialized physical primitives first
+- **Phase 5 — codegen / type-model crate:** formal `NodeKind`/`EdgeKind`/
+  `Enum` types, property catalog, label index. The **typed property store was
+  removed** (see §2): a self-contained heterogeneous column store forces type
+  erasure, and without codegen it collapses to a bare `Vec` wrapper. Typed
+  per-kind stores return **only via codegen** — a `#[derive]` that generates
+  the store struct — so the schema/type-model crate feeds that path.
+- **Phase 6 — query surface:** materialized physical primitives first
   (`lookup`, `project`, `expand`, edge props, scan), then syntax on top.
 
 ---

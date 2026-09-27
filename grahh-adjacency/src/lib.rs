@@ -12,6 +12,16 @@
 //! the expansion primitive behind "give me all `friends` of node 2" and,
 //! by iterating, nested traversal.
 //!
+//! Both levels persist through the portable byte format in `persist`:
+//! [`ChunkedCsr::serialize`] / [`ChunkedCsr::deserialize`] and
+//! [`AdjacencyStore::serialize`] / [`AdjacencyStore::deserialize`] convert to
+//! and from a `Vec<u8>`. The bytes describe themselves — fixed-width
+//! little-endian fields, length-prefixed regions, chunk geometry stored as
+//! data, compressed chunks copied verbatim — and the header's version field
+//! only records which layout they are in. Loading validates structure *and*
+//! every chunk payload up front, so [`PersistenceError`] is the only failure
+//! path and nothing is checked twice.
+//!
 //! Scope notes (per the data model decisions):
 //! - Edges are **directed**; a reversed (in) adjacency list is only built if
 //!   a kind declares an inverse via [`AdjacencyStoreBuilder::set_inverse`].
@@ -21,7 +31,9 @@
 //!   the adjacency store itself.
 
 mod csr;
+mod persist;
 mod store;
 
 pub use csr::{ChunkedCsr, CsrBuilder, NodeId};
+pub use persist::PersistenceError;
 pub use store::{AdjacencyStore, AdjacencyStoreBuilder, Direction, EdgeKindId};

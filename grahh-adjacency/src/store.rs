@@ -15,7 +15,10 @@
 //! - `node_count` is the maximum over all kinds, so a node present only as a
 //!   target in some kind's store is still addressable.
 
-use crate::csr::{ChunkedCsr, CsrBuilder, NodeId};
+use crate::{
+    csr::{ChunkedCsr, CsrBuilder, NodeId},
+    persist::{PersistenceError, Reader, Writer},
+};
 
 /// Identifier for an edge kind. Opaque to this crate; assigned by the schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -84,6 +87,114 @@ impl AdjacencyStore {
             })
             .sum()
     }
+
+    /// Serialize the whole registry into the portable adjacency byte format,
+    /// appending to `out` (existing contents are kept, so regions can nest).
+    ///
+    /// Layout — `header`, kind count, then per kind: its `u32` id, an inverse
+    /// presence byte (`1`/`0`), the out-CSR as a length-prefixed nested region,
+    /// and the in-CSR the same way when present. Each nested CSR is a complete
+    /// self-describing region (its own magic + version), so it stays
+    /// independently decodable and skippable, and its length prefix is
+    /// backpatched in place so nesting costs no extra allocation.
+    ///
+    /// # Errors
+    /// Never fails for a store built by [`AdjacencyStoreBuilder`]; the `Result`
+    /// mirrors [`AdjacencyStore::deserialize`].
+    pub fn serialize(&self, out: &mut Vec<u8>) -> Result<(), PersistenceError> {
+        let mut w: Writer<'_> = Writer::new(out);
+        w.header();
+        w.u64(self.by_kind.len() as u64);
+        for (kind, dir) in self.by_kind.iter() {
+            w.u32(kind.0);
+            w.u8(u8::from(dir.in_.is_some()));
+            write_nested(&mut w, &dir.out)?;
+            if let Some(inverse) = &dir.in_ {
+                write_nested(&mut w, inverse)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild a registry written by [`AdjacencyStore::serialize`].
+    ///
+    /// Every kind's out-CSR (and in-CSR when flagged) is read back through
+    /// [`ChunkedCsr::deserialize`], so nested regions are held to exactly the
+    /// same validation as a standalone CSR.
+    ///
+    /// # Errors
+    /// [`PersistenceError`] if the buffer is truncated, mislabelled, carries an
+    /// unknown direction flag, lists a kind twice, or contains a bad nested CSR
+    /// — the latter reported as [`PersistenceError::Nested`], naming the kind
+    /// and direction it came from.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, PersistenceError> {
+        let mut r: Reader<'_> = Reader::new(bytes);
+        r.header()?;
+
+        let kind_count: usize = r.len_u64()?;
+        // Guard against a bogus count becoming a huge allocation: every kind
+        // costs at least its id plus its direction flag.
+        if kind_count > r.remaining() {
+            return Err(PersistenceError::Corrupt {
+                reason: "kind count exceeds the bytes remaining",
+            });
+        }
+
+        let mut by_kind: Vec<(EdgeKindId, DirectionalCsr)> = Vec::with_capacity(kind_count);
+        for _ in 0..kind_count {
+            let kind: EdgeKindId = EdgeKindId(r.u32()?);
+            if by_kind.iter().any(|(seen, _)| *seen == kind) {
+                return Err(PersistenceError::DuplicateKind { kind: kind.0 });
+            }
+            let has_inverse: bool = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(PersistenceError::Corrupt {
+                        reason: "unknown direction flag",
+                    });
+                }
+            };
+            let out: ChunkedCsr = ChunkedCsr::deserialize(r.len_prefixed()?).map_err(|source| {
+                PersistenceError::Nested {
+                    context: format!("kind {} out-CSR", kind.0),
+                    source: Box::new(source),
+                }
+            })?;
+            let in_: Option<ChunkedCsr> = if has_inverse {
+                Some(
+                    ChunkedCsr::deserialize(r.len_prefixed()?).map_err(|source| {
+                        PersistenceError::Nested {
+                            context: format!("kind {} in-CSR", kind.0),
+                            source: Box::new(source),
+                        }
+                    })?,
+                )
+            } else {
+                None
+            };
+            by_kind.push((kind, DirectionalCsr { out, in_ }));
+        }
+
+        r.finish()?;
+
+        Ok(Self {
+            by_kind: by_kind.into_boxed_slice(),
+        })
+    }
+}
+
+/// Write `csr` into `w` as a length-prefixed nested region.
+///
+/// The length is reserved, then backpatched once the CSR has serialized
+/// straight into the sink — so nesting costs no intermediate buffer.
+fn write_nested(w: &mut Writer<'_>, csr: &ChunkedCsr) -> Result<(), PersistenceError> {
+    let at: usize = w.reserve_len();
+    let start: usize = w.position();
+    csr.serialize(w.sink())?;
+    let len: usize = w.position() - start;
+    w.patch_len(at, len);
+    Ok(())
 }
 
 /// Build a single forward CSR from an *owned* edge list, moving it into the
@@ -246,5 +357,157 @@ mod tests {
         assert_eq!(store.degree(0, FOLLOWS, Direction::Outgoing), 2);
         assert_eq!(store.degree(2, FOLLOWS, Direction::Incoming), 2);
         assert_eq!(store.degree(1, FOLLOWS, Direction::Outgoing), 1);
+    }
+
+    #[test]
+    fn store_round_trips_through_bytes() {
+        let mut b = AdjacencyStoreBuilder::new();
+        b.set_inverse(FOLLOWS);
+        b.add_edge(FOLLOWS, 0, 1);
+        b.add_edge(FOLLOWS, 0, 2);
+        b.add_edge(FOLLOWS, 1, 2);
+        b.add_edge(BLOCKS, 2, 0);
+        let store: AdjacencyStore = b.build();
+
+        let mut bytes: Vec<u8> = Vec::new();
+        store.serialize(&mut bytes).unwrap();
+        let back: AdjacencyStore = AdjacencyStore::deserialize(&bytes).unwrap();
+
+        assert_eq!(back.edge_count(), store.edge_count());
+        for node in 0..5_u64 {
+            for kind in [FOLLOWS, BLOCKS] {
+                for dir in [Direction::Outgoing, Direction::Incoming] {
+                    assert_eq!(
+                        back.neighbors(node, kind, dir),
+                        store.neighbors(node, kind, dir),
+                        "node {node}"
+                    );
+                    assert_eq!(back.degree(node, kind, dir), store.degree(node, kind, dir));
+                }
+            }
+        }
+        // The inverse CSR really survived: without it this would be empty.
+        assert_eq!(back.neighbors(2, FOLLOWS, Direction::Incoming), vec![0, 1]);
+    }
+
+    #[test]
+    fn store_serialization_is_byte_for_byte_stable() {
+        let mut b = AdjacencyStoreBuilder::new();
+        b.set_inverse(FOLLOWS);
+        for source in 0..20_u64 {
+            b.add_edge(FOLLOWS, source, source + 1);
+            b.add_edge(FOLLOWS, source, source + 3);
+        }
+        let store = b.build();
+
+        let mut first: Vec<u8> = Vec::new();
+        store.serialize(&mut first).unwrap();
+        let decoded = AdjacencyStore::deserialize(&first).unwrap();
+        let mut second: Vec<u8> = Vec::new();
+        decoded.serialize(&mut second).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn store_deserialize_rejects_malformed_bytes() {
+        let mut b = AdjacencyStoreBuilder::new();
+        b.set_inverse(FOLLOWS);
+        b.add_edge(FOLLOWS, 0, 1);
+        let store = b.build();
+
+        let mut bytes: Vec<u8> = Vec::new();
+        store.serialize(&mut bytes).unwrap();
+
+        let truncated: &[u8] = &bytes[..bytes.len() - 1];
+        assert!(AdjacencyStore::deserialize(truncated).is_err());
+
+        let mut bad_magic: Vec<u8> = bytes.clone();
+        bad_magic[0] = b'X';
+        assert!(matches!(
+            AdjacencyStore::deserialize(&bad_magic),
+            Err(PersistenceError::BadMagic { .. })
+        ));
+
+        let mut extra: Vec<u8> = bytes.clone();
+        extra.push(0);
+        assert!(matches!(
+            AdjacencyStore::deserialize(&extra),
+            Err(PersistenceError::TrailingBytes { .. })
+        ));
+    }
+
+    #[test]
+    fn store_deserialize_rejects_unknown_direction_flag() {
+        // Hand-built registry: one kind, but an invalid inverse-presence byte.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut w: Writer<'_> = Writer::new(&mut buf);
+        w.header();
+        w.u64(1);
+        w.u32(0);
+        w.u8(7);
+        drop(w);
+
+        assert!(matches!(
+            AdjacencyStore::deserialize(&buf),
+            Err(PersistenceError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn store_deserialize_rejects_duplicate_kinds() {
+        let mut csr: Vec<u8> = Vec::new();
+        let mut edges = CsrBuilder::new();
+        edges.add_edge(0, 1);
+        edges.build().serialize(&mut csr).unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut w: Writer<'_> = Writer::new(&mut buf);
+        w.header();
+        w.u64(2);
+        w.u32(7);
+        w.u8(0);
+        w.len_prefixed(&csr);
+        w.u32(7);
+        w.u8(0);
+        drop(w);
+
+        assert!(matches!(
+            AdjacencyStore::deserialize(&buf),
+            Err(PersistenceError::DuplicateKind { kind: 7 })
+        ));
+    }
+
+    #[test]
+    fn store_reports_which_nested_region_failed() {
+        let mut b = AdjacencyStoreBuilder::new();
+        b.set_inverse(FOLLOWS);
+        b.add_edge(FOLLOWS, 0, 1);
+        let store = b.build();
+
+        let mut bytes: Vec<u8> = Vec::new();
+        store.serialize(&mut bytes).unwrap();
+
+        // Registry framing up to the first nested region: header, kind count,
+        // kind id (u32), inverse flag (u8), then its length prefix.
+        const OUT_CSR_AT: usize = 8 + 8 + 4 + 1 + 8;
+
+        let mut corrupt: Vec<u8> = bytes.clone();
+        corrupt[OUT_CSR_AT] ^= 0xFF;
+        match AdjacencyStore::deserialize(&corrupt) {
+            Err(PersistenceError::Nested { context, .. }) => assert_eq!(context, "kind 0 out-CSR"),
+            other => panic!("expected a nested error, got {other:?}"),
+        }
+
+        let out_len: usize =
+            u64::from_le_bytes(bytes[OUT_CSR_AT - 8..OUT_CSR_AT].try_into().unwrap()) as usize;
+        let in_csr_at: usize = OUT_CSR_AT + out_len + 8;
+
+        let mut corrupt: Vec<u8> = bytes.clone();
+        corrupt[in_csr_at] ^= 0xFF;
+        match AdjacencyStore::deserialize(&corrupt) {
+            Err(PersistenceError::Nested { context, .. }) => assert_eq!(context, "kind 0 in-CSR"),
+            other => panic!("expected a nested error, got {other:?}"),
+        }
     }
 }
