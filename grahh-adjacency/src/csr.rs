@@ -27,7 +27,7 @@ use std::{collections::BTreeMap, range::Range};
 
 use grahh_codecs::{Codec, CoreCodec};
 
-use crate::persist::{PersistenceError, Reader, Writer};
+use grahh_persist::{PersistenceError, Reader, Writer};
 
 /// A dense internal node id: an index into the node store, also used to index
 /// into this CSR's offset array. Dense (no gaps) by renumbering, so the offset

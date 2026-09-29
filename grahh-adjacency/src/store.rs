@@ -15,10 +15,9 @@
 //! - `node_count` is the maximum over all kinds, so a node present only as a
 //!   target in some kind's store is still addressable.
 
-use crate::{
-    csr::{ChunkedCsr, CsrBuilder, NodeId},
-    persist::{PersistenceError, Reader, Writer},
-};
+use grahh_persist::{PersistenceError, Reader, Writer};
+
+use crate::csr::{ChunkedCsr, CsrBuilder, NodeId};
 
 /// Identifier for an edge kind. Opaque to this crate; assigned by the schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -73,6 +72,24 @@ impl AdjacencyStore {
     pub fn degree(&self, node: NodeId, kind: EdgeKindId, dir: Direction) -> usize {
         self.csr_for(kind, dir)
             .map_or_default(|csr: &ChunkedCsr| csr.degree(node))
+    }
+
+    /// Widest *source* id span across all kinds/directions.
+    ///
+    /// Each CSR sizes its offsets from the highest source id it stores, so an id
+    /// that only ever appears as a target does not widen the span — unless the
+    /// kind declares an inverse, where those ids become sources.
+    pub fn node_count(&self) -> usize {
+        self.by_kind
+            .iter()
+            .map(|(_, d)| {
+                d.in_
+                    .as_ref()
+                    .map_or_default(|c: &ChunkedCsr| c.node_count())
+                    .max(d.out.node_count())
+            })
+            .max()
+            .unwrap_or_default()
     }
 
     /// Total edges across all declared kinds/directions.

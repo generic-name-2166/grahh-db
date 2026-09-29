@@ -1,39 +1,43 @@
-//! Portable, self-describing byte format for the adjacency store.
+//! The wire format shared by every GRAHH store.
 //!
-//! This module is the persistence layer's wire format: the single place that
-//! decides how a [`ChunkedCsr`](crate::ChunkedCsr) or an
-//! [`AdjacencyStore`](crate::AdjacencyStore) becomes bytes and back. It is
-//! deliberately **not** struct-punning and **not** a derive-driven binary
-//! codec: every field is an explicit, fixed-width, little-endian integer, so a
-//! file written on one machine reads correctly on any other, and stays
-//! readable by a future version of this code.
+//! This crate owns the byte-level rules, and knows nothing about nodes, edges or
+//! labels. Stores define their own layout on top of these primitives
+//! ([`Writer`], [`Reader`], [`PersistenceError`]), so the format has exactly one
+//! source of truth.
 //!
 //! The rules:
 //! - **Fixed-width little-endian everywhere.** Counts, lengths and offsets are
 //!   `u64` on the wire — never `usize`, whose width is a platform detail.
-//! - **Length-prefixed regions.** Variable-size payloads (compressed chunks,
-//!   nested CSRs) carry their byte length, so a reader never guesses where a
+//! - **Length-prefixed regions.** Variable-size payloads (compressed columns,
+//!   nested regions) carry their byte length, so a reader never guesses where a
 //!   region ends and an unknown region can be skipped wholesale.
 //! - **Self-describing regions.** Every region starts with [`MAGIC`] plus a
-//!   version byte, and every compressed chunk carries its codec's own format
+//!   [`VERSION`], and every compressed column carries its codec's own format
 //!   tag, so decoding needs no out-of-band knowledge.
-//! - **Chunk payloads are copied verbatim** — persisting never recompresses.
-//!   The file layout mirrors the in-memory layout: "on disk == in RAM".
-//!
-//! The stores own the actual layout ([`ChunkedCsr::serialize`] and friends);
-//! this module only provides the primitives they are built from.
+//! - **Payloads are copied verbatim** — persisting never recompresses. The file
+//!   layout mirrors the in-memory layout: "on disk == in RAM".
+//! - **Validate at load, then trust.** Readers validate fully on the way in;
+//!   there are no unchecked load paths, and after a successful load the
+//!   in-memory structures cannot fail on their own data.
 
 use std::{error::Error, fmt};
 
 use grahh_codecs::CodecError;
 
 /// Magic bytes introducing every persisted region.
-pub(crate) const MAGIC: [u8; 4] = *b"GHDB";
+pub const MAGIC: [u8; 4] = *b"GHDB";
 
-pub(crate) const VERSION: u32 = 0;
+/// Layout version the bytes declare.
+///
+/// This is data, not behaviour: the region says which layout it is in, with no
+/// out-of-band knowledge needed. `0` means pre-1.0 — the layout is still moving
+/// and no compatibility is promised, so a reader refuses any version but the one
+/// it was built for. Migrating between layouts is a separate tool that reads an
+/// old structure from scratch; it is not a branch in a reader.
+pub const VERSION: u32 = 0;
 
 /// Number of bytes in a region header ([`MAGIC`] + [`VERSION`]).
-pub(crate) const HEADER_LEN: usize = MAGIC.len() + std::mem::size_of::<u32>();
+pub const HEADER_LEN: usize = MAGIC.len() + std::mem::size_of::<u32>();
 
 /// Anything that can go wrong turning bytes back into a store.
 ///
@@ -55,10 +59,6 @@ pub enum PersistenceError {
         found: [u8; 4],
     },
     /// The region declares a layout version this build does not know.
-    ///
-    /// The version is *data* — it says which layout the bytes are in. Nothing
-    /// is promised about compatibility before 1.0, so anything but the current
-    /// value is refused rather than guessed at.
     UnsupportedVersion {
         /// The version actually found.
         found: u32,
@@ -69,7 +69,8 @@ pub enum PersistenceError {
         /// Human-readable description of the broken invariant.
         reason: &'static str,
     },
-    /// A chunk payload does not decode under the codec tag it carries.
+    /// A chunked column's payload does not decode under the codec tag it
+    /// carries.
     Chunk {
         /// Index of the offending chunk.
         index: usize,
@@ -91,10 +92,26 @@ pub enum PersistenceError {
         /// Index of the offending chunk.
         index: usize,
     },
+    /// A named, whole-column payload does not decode under its codec tag.
+    Column {
+        /// Which column failed, e.g. `"keys"`.
+        name: &'static str,
+        /// Why the codec rejected it.
+        source: CodecError,
+    },
     /// The registry lists the same edge kind twice.
     DuplicateKind {
         /// The repeated kind id.
         kind: u32,
+    },
+    /// A region tag this build does not know.
+    ///
+    /// The format is built so unknown regions *could* be skipped by length, but
+    /// at version 0 nothing is promised about compatibility, so refusing beats
+    /// half-reading a file we do not understand.
+    UnknownRegion {
+        /// The tag actually found.
+        tag: u32,
     },
     /// A nested region failed to load; `context` says which one it was.
     Nested {
@@ -122,9 +139,9 @@ impl fmt::Display for PersistenceError {
             }
             Self::UnsupportedVersion { found } => write!(
                 f,
-                "unsupported adjacency format version {found} (this build writes {VERSION})"
+                "unsupported format version {found} (this build writes {VERSION})"
             ),
-            Self::Corrupt { reason } => write!(f, "corrupt adjacency region: {reason}"),
+            Self::Corrupt { reason } => write!(f, "corrupt region: {reason}"),
             Self::Chunk { index, source } => {
                 write!(f, "chunk {index}: payload does not decode ({source:?})")
             }
@@ -139,7 +156,11 @@ impl fmt::Display for PersistenceError {
             Self::ChunkUnsorted { index } => {
                 write!(f, "chunk {index}: targets are out of order within a node")
             }
+            Self::Column { name, source } => {
+                write!(f, "{name} column: payload does not decode ({source:?})")
+            }
             Self::DuplicateKind { kind } => write!(f, "edge kind {kind} is listed twice"),
+            Self::UnknownRegion { tag } => write!(f, "unknown region tag {tag}"),
             Self::Nested { context, source } => write!(f, "{context}: {source}"),
             Self::TrailingBytes { extra } => {
                 write!(f, "{extra} trailing byte(s) after the described region")
@@ -161,46 +182,46 @@ impl Error for PersistenceError {
 ///
 /// A thin, allocation-free shim over the sink `Vec<u8>`, kept separate from the
 /// stores so the byte layout lives in exactly one place.
-pub(crate) struct Writer<'a> {
+pub struct Writer<'a> {
     out: &'a mut Vec<u8>,
 }
 
 impl<'a> Writer<'a> {
     /// Wrap a buffer to append to (existing contents are kept).
-    pub(crate) fn new(out: &'a mut Vec<u8>) -> Self {
+    pub fn new(out: &'a mut Vec<u8>) -> Self {
         Self { out }
     }
 
     /// Write the region header ([`MAGIC`] + [`VERSION`]).
-    pub(crate) fn header(&mut self) {
+    pub fn header(&mut self) {
         self.out.extend_from_slice(&MAGIC);
         self.u32(VERSION);
     }
 
     /// Write a single byte.
-    pub(crate) fn u8(&mut self, value: u8) {
+    pub fn u8(&mut self, value: u8) {
         self.out.push(value);
     }
 
     /// Write a little-endian `u32` (used for opaque ids such as edge kinds).
-    pub(crate) fn u32(&mut self, value: u32) {
+    pub fn u32(&mut self, value: u32) {
         self.out.extend_from_slice(&value.to_le_bytes());
     }
 
     /// Write a little-endian `u64`. All on-wire counts, lengths and offsets go
     /// through here so nothing platform-dependent ever reaches the format.
-    pub(crate) fn u64(&mut self, value: u64) {
+    pub fn u64(&mut self, value: u64) {
         self.out.extend_from_slice(&value.to_le_bytes());
     }
 
     /// Write raw bytes with no length prefix, for regions whose size the reader
     /// already knows from a preceding field.
-    pub(crate) fn bytes(&mut self, value: &[u8]) {
+    pub fn bytes(&mut self, value: &[u8]) {
         self.out.extend_from_slice(value);
     }
 
     /// Write a `u64` length-prefixed byte region.
-    pub(crate) fn len_prefixed(&mut self, value: &[u8]) {
+    pub fn len_prefixed(&mut self, value: &[u8]) {
         self.u64(value.len() as u64);
         self.bytes(value);
     }
@@ -210,25 +231,32 @@ impl<'a> Writer<'a> {
     /// Lets a nested region be length-prefixed without buffering it separately:
     /// write a placeholder, serialize in place, then fill the length in with
     /// [`Writer::patch_len`].
-    pub(crate) fn reserve_len(&mut self) -> usize {
+    pub fn reserve_len(&mut self) -> usize {
         let at: usize = self.position();
         self.u64(0);
         at
     }
 
+    /// Overwrite bytes at an offset returned by [`Writer::position`].
+    ///
+    /// Backpatching is how length-prefixed and directory-front layouts avoid
+    /// intermediate buffers. Panics if the range is outside what was written.
+    pub fn patch(&mut self, at: usize, bytes: &[u8]) {
+        self.out[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
     /// Fill in a prefix previously reserved by [`Writer::reserve_len`].
-    pub(crate) fn patch_len(&mut self, at: usize, len: usize) {
-        let bytes: [u8; 8] = (len as u64).to_le_bytes();
-        self.out[at..at + bytes.len()].copy_from_slice(&bytes);
+    pub fn patch_len(&mut self, at: usize, len: usize) {
+        self.patch(at, &(len as u64).to_le_bytes());
     }
 
     /// Current length of the sink, i.e. where the next byte will land.
-    pub(crate) fn position(&self) -> usize {
+    pub fn position(&self) -> usize {
         self.out.len()
     }
 
     /// The underlying sink, so a nested store can serialize straight into it.
-    pub(crate) fn sink(&mut self) -> &mut Vec<u8> {
+    pub fn sink(&mut self) -> &mut Vec<u8> {
         self.out
     }
 }
@@ -237,19 +265,19 @@ impl<'a> Writer<'a> {
 ///
 /// Tracks a cursor and never panics on bad input: every method is bounds
 /// checked and reports [`PersistenceError::UnexpectedEof`] instead.
-pub(crate) struct Reader<'a> {
+pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
     /// Start reading at the beginning of a region.
-    pub(crate) fn new(buf: &'a [u8]) -> Self {
+    pub fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
     /// Bytes not yet consumed.
-    pub(crate) fn remaining(&self) -> usize {
+    pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
 
@@ -268,7 +296,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Read and validate the region header, leaving the cursor after it.
-    pub(crate) fn header(&mut self) -> Result<(), PersistenceError> {
+    pub fn header(&mut self) -> Result<(), PersistenceError> {
         let raw: &[u8] = self.take(HEADER_LEN)?;
         let (raw_magic, raw_version) = raw.split_at(MAGIC.len());
         let mut magic: [u8; 4] = [0; 4];
@@ -286,12 +314,12 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a single byte.
-    pub(crate) fn u8(&mut self) -> Result<u8, PersistenceError> {
+    pub fn u8(&mut self) -> Result<u8, PersistenceError> {
         Ok(self.take(1)?[0])
     }
 
     /// Read a little-endian `u32`.
-    pub(crate) fn u32(&mut self) -> Result<u32, PersistenceError> {
+    pub fn u32(&mut self) -> Result<u32, PersistenceError> {
         let raw: &[u8] = self.take(4)?;
         let mut bytes: [u8; 4] = [0; 4];
         bytes.copy_from_slice(raw);
@@ -299,7 +327,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a little-endian `u64`.
-    pub(crate) fn u64(&mut self) -> Result<u64, PersistenceError> {
+    pub fn u64(&mut self) -> Result<u64, PersistenceError> {
         let raw: &[u8] = self.take(8)?;
         let mut bytes: [u8; 8] = [0; 8];
         bytes.copy_from_slice(raw);
@@ -311,7 +339,7 @@ impl<'a> Reader<'a> {
     /// On a 32-bit target a stored length may not be addressable; that is a
     /// corrupt/incompatible file rather than a truncation, so it is reported as
     /// [`PersistenceError::Corrupt`].
-    pub(crate) fn len_u64(&mut self) -> Result<usize, PersistenceError> {
+    pub fn len_u64(&mut self) -> Result<usize, PersistenceError> {
         let raw: u64 = self.u64()?;
         usize::try_from(raw).map_err(|_| PersistenceError::Corrupt {
             reason: "length does not fit in usize on this platform",
@@ -319,7 +347,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a `u64` length-prefixed byte region.
-    pub(crate) fn len_prefixed(&mut self) -> Result<&'a [u8], PersistenceError> {
+    pub fn len_prefixed(&mut self) -> Result<&'a [u8], PersistenceError> {
         let len: usize = self.len_u64()?;
         self.take(len)
     }
@@ -328,7 +356,7 @@ impl<'a> Reader<'a> {
     ///
     /// Catches buffers longer than the region they claim to be, which would
     /// otherwise let a corrupt file masquerade as a valid one.
-    pub(crate) fn finish(&self) -> Result<(), PersistenceError> {
+    pub fn finish(&self) -> Result<(), PersistenceError> {
         let extra: usize = self.remaining();
         if extra == 0 {
             Ok(())
@@ -356,7 +384,6 @@ mod tests {
 
         // Header + u8 (1) + u32 (4) + u64 (8) + (8 + 7) + 3.
         assert_eq!(buf.len(), HEADER_LEN + 1 + 4 + 8 + 8 + 7 + 3);
-        // Written little-endian and self-describing, not in host order.
         assert_eq!(&buf[..4], b"GHDB");
         assert_eq!(&buf[4..HEADER_LEN], &VERSION.to_le_bytes());
         assert_eq!(&buf[HEADER_LEN..HEADER_LEN + 1], &[0xAB]);
@@ -460,9 +487,6 @@ mod tests {
             Ok(())
         }
         let text: String = as_error().unwrap_err().to_string();
-        assert!(
-            text.contains("unsupported adjacency format version 2"),
-            "{text}"
-        );
+        assert!(text.contains("unsupported format version 2"), "{text}");
     }
 }

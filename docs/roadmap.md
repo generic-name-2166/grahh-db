@@ -36,7 +36,7 @@ Three sub-claims to validate with numbers, in order:
 | 1 | Codec layer | ✅ `grahh-codecs` — trait, formats, picker |
 | 2 | Chunked CSR adjacency | ✅ `grahh-adjacency` — `ChunkedCsr` + registry |
 | 3 | Traversal/compression benchmark | ✅ `bench_traversal` |
-| 4 | Persistence: serializable byte format | 🔄 4a done (byte format + validation); 4b/4c later |
+| 4 | Persistence: byte format + database image | 🔄 4a/4d done; 4b (file/mmap) + 4c (WAL) later |
 | 5 | Codegen / type-model crate | ⏳ later (unlocks typed property stores) |
 | 6 | Query surface (primitives + language) | ⏳ later |
 
@@ -53,15 +53,17 @@ API), and without codegen a "store" degenerates to a bare `Vec` wrapper.
 ```
 Cargo.toml            workspace (edition 2024), members:
 grahh-codecs/         dependency-free compression codecs
+grahh-persist/        wire format: header, errors, Reader/Writer primitives
+grahh-index/          identity: label index (user key <-> dense internal id)
 grahh-adjacency/      topology: chunked CSR + per-kind registry
-libgrahh/             (empty stub — future umbrella/engine crate)
+libgrahh/             engine: database image, Database/DatabaseBuilder
 docs/roadmap.md       this file
 ```
 
 Build/test:
 ```
-cargo test -p grahh-codecs
-cargo test -p grahh-adjacency
+cargo test --workspace
+cargo run --example mre -p libgrahh
 cargo run --release --example bench_traversal -p grahh-adjacency
 cargo run --release --example bench_persistence -p grahh-adjacency
 cargo clippy --workspace --all-targets
@@ -178,10 +180,42 @@ little-endian byte stream (`Vec<u8>` in and out). Rules:
 - Cost and size of all this, plus the copy-vs-recompress claim, are measured:
   `cargo run --release --example bench_persistence`.
 
-**4b — file + mmap (deferred).** This std exposes no `std::fs`/`File`/`mmap`
-anywhere yet; real disk I/O and memory-mapped reads land once we confirm the
-primitive exists. The byte format is the file format, so 4b is a thin layer on
-top of 4a.
+**Measured** (100k nodes / 400k edges, `bench_persistence`):
+```
+naive edge payload   3.05 MiB
+csr payload          1.61 MiB   (800 KB offsets + 887 KB compressed chunks)
+serialized image     1.70 MiB   (framing 100 KB = 16 B/chunk directory)
+build csr            650   ms
+serialize            9.2   ms   (186 MiB/s — a pure copy)
+load                 42.9  ms   (40 MiB/s — validates every chunk payload)
+load vs rebuild      15.2x faster
+```
+Framing is cheap and payloads are genuinely copied (format usage identical after
+a load, expansion results identical). Load cost is dominated by decoding every
+chunk for validation plus one allocation per chunk — the price of "validate at
+connect", and the number to watch as images grow (~25 ms/MiB).
+
+**4d — database image (done).** A registry alone was not a database: it had no
+identity layer and no file-level envelope. Both now exist.
+- `grahh-index` — `LabelIndex`: user `u64` key ↔ dense internal id, ids issued on
+  first sight, persisted as two coded columns (sorted keys + the id permutation).
+  The reverse direction is rebuilt on load, so it costs nothing on the wire.
+- `libgrahh` — the envelope: `header`, region count, a fixed-size directory
+  (`tag u32 | offset u64 | length u64`), then the regions. Offsets are absolute
+  and regions contiguous: a gap, overlap, entry past the end or trailing byte is
+  rejected. Unknown tags are *refused* — the format could skip them by length,
+  but at version 0 there is no compatibility promise, so refusing beats
+  half-reading a file we do not understand.
+- `Database`/`DatabaseBuilder`: declare edges by key, ids are assigned on first
+  sight, and `lookup → expand → key_of` is the first end-to-end query path.
+- Cross-region check: the adjacency id span may not exceed the label index. It is
+  source-based (each CSR sizes its offsets from its highest source id), so a
+  target-only id is bounded only when the kind declares an inverse.
+
+**4b — file + mmap (deferred).** The byte format is the file format, so this is a
+thin layer on top of 4a: read the whole image in and `deserialize`, or map it and
+borrow the regions. What std lacks is `mmap` (a dependency or platform FFI);
+`std::fs` itself exists, to be confirmed when 4b starts.
 
 **4c — WAL / compaction / renumbering (even later).** Write-path concerns,
 not needed until there are in-place mutations.
@@ -223,3 +257,25 @@ Deliberate deferrals; revisit after the MVP query works end-to-end.
    profiles.
 8. **Dependent properties** (e.g. follower count maintained engine-side) —
    discussed, intentionally out of scope for the adjacency store.
+9. **Offsets are the uncompressed column** — measured at ~45% of the store on
+   `bench_persistence` (800 KB of a 1.70 MiB image). Its share is `8 / (8 + c·D)`
+   for `c` bytes per compressed id and average degree `D`, so it *grows* as the
+   codec does better and as average degree drops: at D=4 with FOR-style 0.8 B/id
+   the offsets would be ~71% of the working set, i.e. the column eats the win the
+   compression architecture exists to deliver. Ideas to benchmark against each
+   other, cheapest first:
+   (a) `u32` offsets when `edge_count < 2^32` — 2x cut, still O(1), no new
+   concepts; (b) fixed-width bitpacked offsets, width = `bits(edge_count)` —
+   ~2.4 B at 400k edges and grows only logarithmically, O(1) shift+mask but needs
+   a random-access bit reader; (c) coarse block table + bitpacked per-node
+   degrees — ~1.5 B, ~8 adds per expansion; (d) sparse/rank form for kinds that
+   touch few ids. Every one of these changes RAM *and* file layout together, so
+   it is a format change (migration tool), and the author is against
+   varied-width offsets on principle — benchmark the rest before proposing it.
+10. **One allocation per chunk on load** — 6,250 `Box<[u8]>` for the benchmark
+    image, visible in the 42.9 ms load. A single arena (one buffer + ranges)
+    removes it and is the shape a borrowed/mapped reader will want anyway.
+11. **Cross-region check is one-sided** — the adjacency id span only bounds
+    *source* ids; targets are bounded indirectly (an inverse makes them sources).
+    The load-time validation pass already walks every decoded value, so tracking
+    the highest referenced id there would close the gap for free-ish.
