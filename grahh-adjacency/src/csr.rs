@@ -38,6 +38,21 @@ pub type NodeId = u64;
 /// cannot drive an absurd allocation.
 const MAX_CHUNK_SLOTS: usize = 1 << 16;
 
+/// One past the highest id a store references: its source span, widened by any
+/// target that reaches further.
+///
+/// Derived (never stored), so a store's file format does not change when the
+/// identity layer wants to check it.
+fn id_span_of(node_count: usize, max_target: Option<NodeId>) -> usize {
+    match max_target {
+        Some(id) => {
+            let span: u64 = (node_count as u64).max(id.saturating_add(1));
+            usize::try_from(span).unwrap_or(usize::MAX)
+        }
+        None => node_count,
+    }
+}
+
 /// One fixed-size slice of the neighbor column, compressed.
 ///
 /// `len` is how many target ids this chunk holds; `packed` is its codec
@@ -163,6 +178,9 @@ pub struct ChunkedCsr {
     /// `neighbors[ci]` covers flat positions
     /// `[ ci*chunk_slots .. ci*chunk_slots + neighbors[ci].len )`.
     neighbors: Box<[Chunk]>,
+    /// One past the highest id referenced anywhere in this store, sources
+    /// included. Derived on build and on load; never stored.
+    id_span: usize,
 }
 
 impl ChunkedCsr {
@@ -185,16 +203,27 @@ impl ChunkedCsr {
             pos = end;
         }
 
+        let id_span: usize = id_span_of(offsets.len().saturating_sub(1), neighbors.iter().copied().max());
+
         Self {
             chunk_slots,
             offsets,
             neighbors: chunks.into_boxed_slice(),
+            id_span,
         }
     }
 
     /// Flat positions one chunk spans in this store.
     pub fn chunk_slots(&self) -> usize {
         self.chunk_slots
+    }
+
+    /// One past the highest id this store references, sources included.
+    ///
+    /// A target can reach past every source, so this is what an identity layer
+    /// has to cover for the store's references to be resolvable.
+    pub fn id_span(&self) -> usize {
+        self.id_span
     }
 
     /// Number of distinct node ids indexed by this store.
@@ -372,6 +401,7 @@ impl ChunkedCsr {
         let mut total: usize = 0;
         let mut node: usize = 0;
         let mut previous: Option<NodeId> = None;
+        let mut highest: Option<NodeId> = None;
         for index in 0..chunk_count {
             let len: usize = r.len_u64()?;
             if len == 0 || len > chunk_slots {
@@ -397,9 +427,10 @@ impl ChunkedCsr {
                     decoded: scratch.len(),
                 });
             }
-            // Targets are sorted within each node's slice; the flat column is
-            // grouped by node, so walk the node boundaries and compare only
-            // values belonging to the same node.
+            // Targets are sorted within each node's slice, and a chunk boundary
+            // can fall inside a slice, so walk the node boundaries and compare
+            // only values belonging to the same node. `previous` carries across
+            // chunks and resets when the node advances.
             let chunk_start: usize = index * chunk_slots;
             let mut ordered: bool = true;
             for (at, &value) in scratch.iter().enumerate() {
@@ -417,6 +448,9 @@ impl ChunkedCsr {
             if !ordered {
                 return Err(PersistenceError::ChunkUnsorted { index });
             }
+            // Track the furthest id referenced: the identity layer uses it to
+            // confirm every reference made by this store resolves.
+            highest = highest.max(scratch.last().copied());
 
             total += len;
             chunks.push(Chunk {
@@ -436,6 +470,7 @@ impl ChunkedCsr {
             chunk_slots,
             offsets: offsets.into_boxed_slice(),
             neighbors: chunks.into_boxed_slice(),
+            id_span: id_span_of(node_count, highest),
         })
     }
 
@@ -641,7 +676,6 @@ mod tests {
         w.u64(0);
         w.u64(1);
         w.u64(2);
-        drop(w);
 
         assert!(matches!(
             ChunkedCsr::deserialize(&buf),
@@ -714,7 +748,6 @@ mod tests {
         w.u64(1);
         w.u64(2);
         w.len_prefixed(&packed);
-        drop(w);
 
         assert!(matches!(
             ChunkedCsr::deserialize(&buf),
@@ -736,7 +769,6 @@ mod tests {
         w.u64(6);
         w.u64(2);
         w.u64(2);
-        drop(w);
 
         assert!(matches!(
             ChunkedCsr::deserialize(&buf),

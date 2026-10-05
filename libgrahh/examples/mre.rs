@@ -50,7 +50,11 @@ fn main() {
     // ---- Persist the whole database as one image ----
     let mut image: Vec<u8> = Vec::new();
     built.serialize(&mut image).unwrap();
-    println!("image : {} bytes for {} nodes", image.len(), built.node_count());
+    println!(
+        "image : {} bytes for {} nodes",
+        image.len(),
+        built.node_count()
+    );
 
     // ---- Load it back and query only the loaded copy ----
     let db: Database = Database::deserialize(&image).unwrap();
@@ -61,9 +65,9 @@ fn main() {
     );
 
     let alice: NodeId = db.lookup(1).expect("key 1 is in the index");
-    println!("lookup 1        -> node {alice}");
-    println!("lookup 999      -> {:?}", db.lookup(999));
-    println!("key_of {alice}       -> {:?}", db.key_of(alice));
+    println!("lookup {:<3} -> node {alice}", 1);
+    println!("lookup {:<3} -> {:?}", 999, db.lookup(999));
+    println!("key_of {:<3} -> {:?}", alice, db.key_of(alice));
 
     let follows: Vec<u64> = expand_keys(&db, alice, FOLLOWS, Direction::Outgoing);
     println!("\nfollows         {:?}", follows);

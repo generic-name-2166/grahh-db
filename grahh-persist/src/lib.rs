@@ -380,7 +380,6 @@ mod tests {
         w.u64(0xDEAD_BEEF_1234_5678);
         w.len_prefixed(b"payload");
         w.bytes(b"raw");
-        drop(w);
 
         // Header + u8 (1) + u32 (4) + u64 (8) + (8 + 7) + 3.
         assert_eq!(buf.len(), HEADER_LEN + 1 + 4 + 8 + 8 + 7 + 3);
@@ -408,7 +407,6 @@ mod tests {
         w.bytes(b"nested region");
         let len: usize = w.position() - start;
         w.patch_len(at, len);
-        drop(w);
 
         let mut r = Reader::new(&buf);
         r.header().unwrap();
@@ -449,7 +447,6 @@ mod tests {
         let mut w = Writer::new(&mut buf);
         w.header();
         w.u64(7);
-        drop(w);
 
         // Exactly the one `u64` written: reads cleanly, nothing left over.
         let mut r = Reader::new(&buf);

@@ -74,19 +74,20 @@ impl AdjacencyStore {
             .map_or_default(|csr: &ChunkedCsr| csr.degree(node))
     }
 
-    /// Widest *source* id span across all kinds/directions.
+    /// One past the highest id referenced anywhere in this registry, sources
+    /// included.
     ///
-    /// Each CSR sizes its offsets from the highest source id it stores, so an id
-    /// that only ever appears as a target does not widen the span — unless the
-    /// kind declares an inverse, where those ids become sources.
-    pub fn node_count(&self) -> usize {
+    /// This is what an identity layer must cover for every reference here to
+    /// resolve — including ids that appear only as targets, which is how a
+    /// corrupt or foreign image gets caught at load.
+    pub fn id_span(&self) -> usize {
         self.by_kind
             .iter()
             .map(|(_, d)| {
                 d.in_
                     .as_ref()
-                    .map_or_default(|c: &ChunkedCsr| c.node_count())
-                    .max(d.out.node_count())
+                    .map_or_default(|c: &ChunkedCsr| c.id_span())
+                    .max(d.out.id_span())
             })
             .max()
             .unwrap_or_default()
@@ -361,6 +362,8 @@ mod tests {
         b.add_edge(BLOCKS, 5, 0);
         let store = b.build();
         assert_eq!(store.edge_count(), 2);
+        // Highest source is 5, so ids 0..=5 must exist for the edges to resolve.
+        assert_eq!(store.id_span(), 6);
     }
 
     #[test]
@@ -463,7 +466,6 @@ mod tests {
         w.u64(1);
         w.u32(0);
         w.u8(7);
-        drop(w);
 
         assert!(matches!(
             AdjacencyStore::deserialize(&buf),
@@ -487,7 +489,6 @@ mod tests {
         w.len_prefixed(&csr);
         w.u32(7);
         w.u8(0);
-        drop(w);
 
         assert!(matches!(
             AdjacencyStore::deserialize(&buf),

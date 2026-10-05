@@ -217,7 +217,6 @@ mod tests {
         w.u64(count);
         write_column(&mut w, keys);
         write_column(&mut w, ids);
-        drop(w);
     }
 
     fn write_index(out: &mut Vec<u8>, keys: &[u64], ids: &[u64]) {
@@ -312,7 +311,6 @@ mod tests {
         w.u64(1);
         w.len_prefixed(&[0xFF, 0, 0, 0, 0]); // no such codec tag
         w.len_prefixed(&[0xFF, 0, 0, 0, 0]);
-        drop(w);
 
         assert!(matches!(
             LabelIndex::deserialize(&buf),

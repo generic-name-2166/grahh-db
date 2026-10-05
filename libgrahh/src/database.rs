@@ -56,8 +56,10 @@ impl Database {
     /// Rebuild a database written by [`Database::serialize`].
     ///
     /// The envelope is validated first, then each region by its own reader, and
-    /// finally the regions against each other: topology may only reference ids
-    /// the identity layer knows about.
+    /// finally the regions against each other: every id the topology references
+    /// — sources and targets, both directions — must exist in the identity
+    /// layer, so a dangling reference fails the load rather than surfacing later
+    /// as a missing key.
     ///
     /// # Errors
     /// [`PersistenceError`] if the image is truncated or corrupt, if a required
@@ -93,7 +95,9 @@ impl Database {
             reason: "image has no adjacency region",
         })?;
 
-        if adjacency.node_count() > labels.node_count() {
+        // Both directions, and targets too: `id_span` is what an identity layer
+        // has to cover, so every reference in the file is bounded here.
+        if adjacency.id_span() > labels.node_count() {
             return Err(PersistenceError::Corrupt {
                 reason: "adjacency references ids the label index does not know",
             });
@@ -275,8 +279,7 @@ mod tests {
 
         let mut registry: Vec<u8> = Vec::new();
         let mut adjacency = AdjacencyStoreBuilder::new();
-        // A source id past the end of the identity layer: the store's id span is
-        // derived from source ids, which is exactly what the cross-check bounds.
+        // A source id past the end of the identity layer.
         adjacency.add_edge(FOLLOWS, 5, 0);
         adjacency.build().serialize(&mut registry).unwrap();
 
@@ -297,6 +300,64 @@ mod tests {
             Database::deserialize(&image),
             Err(PersistenceError::Corrupt { .. })
         ));
+    }
+
+    #[test]
+    fn image_rejects_a_target_only_id() {
+        // The store's own span comes from source ids, so a target reaching past
+        // the identity layer can only be caught by the reference check.
+        let mut labels: Vec<u8> = Vec::new();
+        let mut keys = LabelIndexBuilder::new();
+        keys.add(7);
+        keys.build().serialize(&mut labels).unwrap();
+
+        let mut registry: Vec<u8> = Vec::new();
+        let mut adjacency = AdjacencyStoreBuilder::new();
+        adjacency.add_edge(FOLLOWS, 0, 7); // source 0 is known, target 7 is not
+        adjacency.build().serialize(&mut registry).unwrap();
+
+        let mut image: Vec<u8> = Vec::new();
+        let regions: [(u32, RegionWriter<'_>); 2] = [
+            (TAG_LABELS, &|bytes| {
+                bytes.extend_from_slice(&labels);
+                Ok(())
+            }),
+            (TAG_ADJACENCY, &|bytes| {
+                bytes.extend_from_slice(&registry);
+                Ok(())
+            }),
+        ];
+        write_image(&mut image, &regions).unwrap();
+
+        assert!(matches!(
+            Database::deserialize(&image),
+            Err(PersistenceError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn an_id_no_edge_touches_is_not_addressable_yet() {
+        // Known limit: a store's span comes from the ids it stores, so an id
+        // with no edges is out of range for `expand` until chunking is sized by
+        // the identity layer instead. The label index still knows it, and the
+        // reference check at load still bounds every id that *is* referenced.
+        let mut b = DatabaseBuilder::new();
+        b.edge(FOLLOWS, 100, 200); // ids 0 and 1
+        b.node(300); // id 2, no edges
+        let db: Database = b.build();
+
+        assert_eq!(db.node_count(), 3);
+        assert_eq!(db.lookup(300), Some(2));
+        assert_eq!(
+            db.expand(2, FOLLOWS, Direction::Outgoing),
+            Vec::<NodeId>::new()
+        );
+
+        let mut bytes: Vec<u8> = Vec::new();
+        db.serialize(&mut bytes).unwrap();
+        let back: Database = Database::deserialize(&bytes).unwrap();
+        assert_eq!(back.lookup(300), Some(2));
+        assert_eq!(back.key_of(2), Some(300));
     }
 
     #[test]

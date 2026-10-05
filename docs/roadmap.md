@@ -175,8 +175,10 @@ little-endian byte stream (`Vec<u8>` in and out). Rules:
   from scratch, not by branching inside this reader.
 - **Validate at connect time, then trust**: structural checks (magic, version,
   geometry, monotonic offsets, counts, no trailing bytes) *and* every chunk
-  payload (decodes, produces the declared id count, targets in order). There is
-  no unchecked load path; after a load, decoding has no failure path left.
+  payload (decodes, produces the declared id count, targets ordered *within each
+  node's slice* — a chunk boundary can fall inside a slice, so node boundaries
+  are not chunk boundaries). There is no unchecked load path; after a load,
+  decoding has no failure path left.
 - Cost and size of all this, plus the copy-vs-recompress claim, are measured:
   `cargo run --release --example bench_persistence`.
 
@@ -208,14 +210,19 @@ identity layer and no file-level envelope. Both now exist.
   half-reading a file we do not understand.
 - `Database`/`DatabaseBuilder`: declare edges by key, ids are assigned on first
   sight, and `lookup → expand → key_of` is the first end-to-end query path.
-- Cross-region check: the adjacency id span may not exceed the label index. It is
-  source-based (each CSR sizes its offsets from its highest source id), so a
-  target-only id is bounded only when the kind declares an inverse.
+- Cross-region check: every id the topology references — sources and targets,
+  both directions — must be covered by the label index, so a dangling reference
+  fails the load rather than surfacing later as a missing key. A region's
+  `id_span` is derived (never stored), so this costs no format change. Known
+  limit: an id with no edges is not yet addressable, because a store's span
+  comes from the ids it actually stores.
 
-**4b — file + mmap (deferred).** The byte format is the file format, so this is a
-thin layer on top of 4a: read the whole image in and `deserialize`, or map it and
-borrow the regions. What std lacks is `mmap` (a dependency or platform FFI);
-`std::fs` itself exists, to be confirmed when 4b starts.
+**4b — file + mmap (deferred).** The engine performs no I/O of its own: every
+`serialize`/`deserialize` is a pure function over bytes (sans-io), which is why
+there is nothing to change when files arrive. 4b is therefore an *adapter*: read
+the image in and `deserialize`, or map it and borrow the regions, in a separate
+crate that the core does not depend on. What std lacks is `mmap` (a dependency or
+platform FFI); `std::fs` itself exists, to be confirmed when 4b starts.
 
 **4c — WAL / compaction / renumbering (even later).** Write-path concerns,
 not needed until there are in-place mutations.
@@ -232,6 +239,13 @@ not needed until there are in-place mutations.
   the store struct — so the schema/type-model crate feeds that path.
 - **Phase 6 — query surface:** materialized physical primitives first
   (`lookup`, `project`, `expand`, edge props, scan), then syntax on top.
+- **Phase 7 — I/O adapters (later):** the core is sans-io by construction, so
+  `std::fs`, `mmap` and async runtimes belong in separate crates that depend on
+  the engine, never the reverse. `no-std`/`no-alloc` is aspirational and
+  currently blocked by the stores themselves: offsets and chunks are `Vec`/`Box`
+  shaped, `PersistenceError` carries a `String`, and the builders use maps.
+  A borrowed/arena representation is the prerequisite, and it is the same work
+  `mmap` wants.
 
 ---
 
@@ -275,7 +289,10 @@ Deliberate deferrals; revisit after the MVP query works end-to-end.
 10. **One allocation per chunk on load** — 6,250 `Box<[u8]>` for the benchmark
     image, visible in the 42.9 ms load. A single arena (one buffer + ranges)
     removes it and is the shape a borrowed/mapped reader will want anyway.
-11. **Cross-region check is one-sided** — the adjacency id span only bounds
-    *source* ids; targets are bounded indirectly (an inverse makes them sources).
-    The load-time validation pass already walks every decoded value, so tracking
-    the highest referenced id there would close the gap for free-ish.
+11. **Cross-region check is exact for referenced ids** — the adjacency region
+    derives an `id_span` (highest id stored, targets included) and the image
+    refuses one that outruns the label index, so a dangling reference — a
+    source *or* a target — fails the load instead of surfacing later as a
+    missing key. Remaining gap: an id with no edges at all is invisible to
+    `expand` because a store's span comes from the ids it stores; closing that
+    means chunking sized by the identity layer rather than by stored ids.
