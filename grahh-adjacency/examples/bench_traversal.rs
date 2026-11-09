@@ -1,8 +1,10 @@
 //! Traversal benchmark: chunked CSR vs a naive adjacency list.
 //!
-//! Validates the "index-free adjacency" premise: does a compressed, chunked
-//! CSR give fast neighbor expansion and nested traversal versus the naive
-//! in-RAM `Vec<Vec<NodeId>>` representation?
+//! The CSR is the in-memory query structure. Durable persistence now goes
+//! through the LSM tablet engine (`grahh-lsm`); see `bench_persistence` for
+//! that path. This example validates the "index-free adjacency" premise: does
+//! a compressed, chunked CSR give fast neighbor expansion and nested traversal
+//! versus the naive in-RAM `Vec<Vec<NodeId>>` representation?
 //!
 //! Run: `cargo run --release --example bench_traversal`
 //!
@@ -72,7 +74,7 @@ fn main() {
         edges.len()
     );
 
-    // ---- Build both stores from the same edges ----
+    // ---- Build both query structures from the same edges ----
     let t0: Instant = Instant::now();
     let naive: Vec<Vec<u64>> = build_naive(&edges);
     let t_naive: Duration = t0.elapsed();

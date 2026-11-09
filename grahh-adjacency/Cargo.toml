@@ -7,3 +7,6 @@ publish.workspace = true
 [dependencies]
 grahh-codecs = { path = "../grahh-codecs" }
 grahh-persist = { path = "../grahh-persist" }
+
+[dev-dependencies]
+grahh-lsm = { path = "../grahh-lsm" }
