@@ -236,14 +236,12 @@ impl Engine {
 
         for (_, filename) in self.levels.tablets_newest_first() {
             let tablet = self.tablet(&filename)?;
-            for (key, _) in tablet.keys() {
-                if key.kind_id != kind_id || !seen.insert(key) {
+            for (key, values) in tablet.scan_kind(kind_id)? {
+                if !seen.insert(key) {
                     continue;
                 }
-                if let Some(values) = tablet.get(key)? {
-                    for value in values {
-                        out.push((key.node_id, value));
-                    }
+                for value in values {
+                    out.push((key.node_id, value));
                 }
             }
         }

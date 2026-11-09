@@ -209,6 +209,59 @@ impl Tablet {
         ))
     }
 
+    /// Every key for `kind_id` with its rows, in key order.
+    ///
+    /// The chunk is decoded once, unlike calling [`Tablet::get`] for each key.
+    pub fn scan_kind(&self, kind_id: u32) -> Result<Vec<(Key, Vec<Value>)>> {
+        let decoded = self
+            .chunks
+            .get(&kind_id)
+            .map(|chunk| chunk.decode(kind_id))
+            .transpose()?;
+        let mut out = Vec::new();
+        let mut row = 0_usize;
+        for (&key, &length) in self
+            .key_lengths
+            .iter()
+            .filter(|(key, _)| key.kind_id == kind_id)
+        {
+            let length = length as usize;
+            let mut values = Vec::with_capacity(length);
+            match &decoded {
+                Some(decoded) => {
+                    let end = row.checked_add(length).ok_or_else(|| {
+                        LsmError::Corrupt(format!("kind {kind_id} row count overflows usize"))
+                    })?;
+                    if end > decoded.targets.len() {
+                        return Err(LsmError::Corrupt(format!(
+                            "key {key:?} declares {length} rows but kind {kind_id} chunk is too short"
+                        )));
+                    }
+                    for at in row..end {
+                        values.push(Value::new(decoded.targets[at], decoded.edges[at]));
+                    }
+                    row = end;
+                }
+                None if length > 0 => {
+                    return Err(LsmError::Corrupt(format!(
+                        "key {key:?} has rows but kind {kind_id} has no chunk"
+                    )));
+                }
+                None => {}
+            }
+            out.push((key, values));
+        }
+        if let Some(decoded) = &decoded
+            && row != decoded.targets.len()
+        {
+            return Err(LsmError::Corrupt(format!(
+                "kind {kind_id} chunk has {} rows but its keys declare {row}",
+                decoded.targets.len()
+            )));
+        }
+        Ok(out)
+    }
+
     /// Serialize the whole tablet.
     pub fn serialize(&self) -> Vec<u8> {
         let bloom = self.bloom.serialize();
@@ -670,6 +723,27 @@ mod tests {
         );
         assert_eq!(back.get(Key::new(12, 1)).unwrap(), Some(vec![]));
         assert_eq!(back.get(Key::new(99, 0)).unwrap(), None);
+    }
+
+    #[test]
+    fn scan_kind_keeps_empty_keys_and_skips_other_kinds() {
+        let tablet = Tablet::deserialize(&sample().serialize()).unwrap();
+
+        assert_eq!(
+            tablet.scan_kind(0).unwrap(),
+            vec![
+                (Key::new(10, 0), vec![Value::new(20, 0), Value::new(21, 1)]),
+                (Key::new(11, 0), vec![Value::new(22, 0)]),
+            ]
+        );
+        assert_eq!(
+            tablet.scan_kind(1).unwrap(),
+            vec![
+                (Key::new(10, 1), vec![Value::new(30, 0)]),
+                (Key::new(12, 1), vec![]),
+            ]
+        );
+        assert!(tablet.scan_kind(7).unwrap().is_empty());
     }
 
     #[test]
