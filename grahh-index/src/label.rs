@@ -97,6 +97,11 @@ impl LabelIndex {
         self.by_id.get(at).copied()
     }
 
+    /// Iterate `(user key, internal id)` pairs in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, NodeId)> + '_ {
+        self.keys.iter().copied().zip(self.ids.iter().copied())
+    }
+
     /// Serialize into the portable byte format, appending to `out`.
     ///
     /// Layout: `header`, key count, then two length-prefixed columns of verbatim

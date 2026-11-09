@@ -1,11 +1,10 @@
-//! Minimum end-to-end use of the database API: build by key, persist, load, then
-//! run the query the engine exists for.
+//! Minimum end-to-end use of the database API: build by key, persist through
+//! the LSM engine, load, then run the query the engine exists for.
 //!
 //! ```text
 //! build:  edges are declared by user key; ids are assigned on first sight
-//! image:  header + directory                                 (grahh-persist)
-//!         region 1: label index      user key <-> dense id   (grahh-index)
-//!         region 2: adjacency        topology per edge kind  (grahh-adjacency)
+//! save:   label index + per-kind adjacency -> LSM tablets
+//! load:   LSM tablets -> label index + compressed CSR registry
 //! query:  key -> id  (lookup)
 //!         id -> ids  (expand through one edge kind, one direction)
 //!         id -> key  (key_of), or repeat for a nested traversal
@@ -13,7 +12,9 @@
 //!
 //! Run: `cargo run --example mre -p libgrahh`
 
-use libgrahh::{Database, DatabaseBuilder, Direction, EdgeKindId, NodeId};
+use std::fs;
+
+use libgrahh::{Database, DatabaseBuilder, Direction, EdgeKindId, Engine, NodeId};
 
 /// `follows` is directional and we want "who follows me", so it declares an
 /// inverse. `likes` does not.
@@ -47,17 +48,22 @@ fn main() {
         built.edge_count()
     );
 
-    // ---- Persist the whole database as one image ----
-    let mut image: Vec<u8> = Vec::new();
-    built.serialize(&mut image).unwrap();
+    // ---- Persist the whole graph through the LSM engine ----
+    let dir = std::env::temp_dir().join(format!("grahh-mre-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let mut engine = Engine::open(&dir).unwrap();
+    built.save(&mut engine).unwrap();
+    let tablets = engine.tablet_count();
+    drop(engine);
     println!(
-        "image : {} bytes for {} nodes",
-        image.len(),
+        "saved : {} LSM tablet(s) for {} nodes",
+        tablets,
         built.node_count()
     );
 
     // ---- Load it back and query only the loaded copy ----
-    let db: Database = Database::deserialize(&image).unwrap();
+    let engine = Engine::open(&dir).unwrap();
+    let db: Database = Database::load(&engine).unwrap();
     println!(
         "loaded: {} nodes, {} edges\n",
         db.node_count(),
@@ -89,4 +95,6 @@ fn main() {
     friends_of_friends.dedup();
     friends_of_friends.retain(|key| *key != 1);
     println!("\n2-hop from 1    {friends_of_friends:?}");
+
+    let _ = fs::remove_dir_all(&dir);
 }

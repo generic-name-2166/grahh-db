@@ -74,6 +74,29 @@ impl AdjacencyStore {
             .map_or_default(|csr: &ChunkedCsr| csr.degree(node))
     }
 
+    /// Every edge kind present in this registry.
+    pub fn kinds(&self) -> impl Iterator<Item = EdgeKindId> + '_ {
+        self.by_kind.iter().map(|(kind, _)| *kind)
+    }
+
+    /// `true` if `kind` declared an incoming (reverse) CSR.
+    pub fn has_inverse(&self, kind: EdgeKindId) -> bool {
+        self.by_kind
+            .iter()
+            .find(|(seen, _)| *seen == kind)
+            .is_some_and(|(_, directional)| directional.in_.is_some())
+    }
+
+    /// Every forward edge for `kind`, in source order.
+    ///
+    /// This is the export path used to move a built registry into the LSM
+    /// store; it never returns the reverse edges.
+    pub fn out_edges(&self, kind: EdgeKindId) -> Vec<(NodeId, NodeId)> {
+        self.csr_for(kind, Direction::Outgoing)
+            .map(|csr| csr.edges().collect())
+            .unwrap_or_default()
+    }
+
     /// One past the highest id referenced anywhere in this registry, sources
     /// included.
     ///

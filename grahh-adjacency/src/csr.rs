@@ -203,7 +203,10 @@ impl ChunkedCsr {
             pos = end;
         }
 
-        let id_span: usize = id_span_of(offsets.len().saturating_sub(1), neighbors.iter().copied().max());
+        let id_span: usize = id_span_of(
+            offsets.len().saturating_sub(1),
+            neighbors.iter().copied().max(),
+        );
 
         Self {
             chunk_slots,
@@ -312,6 +315,19 @@ impl ChunkedCsr {
             out.extend_from_slice(&decoded[lo - cstart..hi - cstart]);
         }
         out
+    }
+
+    /// Iterate every stored `(source, target)` edge in source order.
+    ///
+    /// This is the export path used to move a built CSR into the LSM store.
+    /// It allocates one neighbor vector per source node; it is not on the
+    /// hot query path.
+    pub fn edges(&self) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
+        (0..self.node_count() as NodeId).flat_map(move |source| {
+            self.neighbors(source)
+                .into_iter()
+                .map(move |target| (source, target))
+        })
     }
 
     /// Serialize this store into the portable adjacency byte format, appending

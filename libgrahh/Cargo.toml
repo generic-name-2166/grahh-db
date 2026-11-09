@@ -7,4 +7,4 @@ publish.workspace = true
 [dependencies]
 grahh-adjacency = { path = "../grahh-adjacency" }
 grahh-index = { path = "../grahh-index" }
-grahh-persist = { path = "../grahh-persist" }
+grahh-lsm = { path = "../grahh-lsm" }

@@ -3,6 +3,7 @@ members = [
     "grahh-adjacency",
     "grahh-codecs",
     "grahh-index",
+    "grahh-lsm",
     "grahh-persist",
     "libgrahh",
 ]

@@ -1,13 +1,26 @@
-//! The database: identity plus topology, persisted as one image.
+//! The database: identity plus topology, persisted through the LSM layer.
+//!
+//! The query structures ([`LabelIndex`] and [`AdjacencyStore`]) stay in memory:
+//! they are what make `lookup -> expand -> key_of` an index-free pointer chase.
+//! The LSM engine is the durable representation. [`Database::save`] exports the
+//! in-memory graph into an [`Engine`]; [`Database::load`] rebuilds it from the
+//! engine, with the same validation the old single-image loader performed.
+
+use std::collections::BTreeMap;
 
 use grahh_adjacency::{AdjacencyStore, AdjacencyStoreBuilder, Direction, EdgeKindId};
 use grahh_index::{LabelIndex, LabelIndexBuilder, NodeId};
-use grahh_persist::PersistenceError;
+use grahh_lsm::{Engine, Key, LsmError};
 
-use crate::image::{Region, RegionWriter, TAG_ADJACENCY, TAG_LABELS, read_image, write_image};
+/// Reserved LSM kind holding the label index: `key = (user_key, LABEL)` and
+/// `value = (dense_id, 0)`.
+const LABEL_KIND_ID: u32 = u32::MAX;
+/// Reserved LSM kind recording which edge kinds declared an inverse:
+/// `key = (kind_id, INVERSE)` and `value = (1, 0)`.
+const INVERSE_KIND_ID: u32 = u32::MAX - 1;
 
 /// An immutable graph: user keys resolved to dense internal ids, topology per
-/// edge kind, all in one persisted image.
+/// edge kind, persisted through an LSM key-value store.
 #[derive(Debug)]
 pub struct Database {
     labels: LabelIndex,
@@ -40,83 +53,116 @@ impl Database {
         self.adjacency.neighbors(node, kind, dir)
     }
 
-    /// Serialize the whole database, appending to `out`.
+    /// Export this database into an LSM engine and flush it.
+    ///
+    /// The engine is expected to be a fresh database directory. Writing into a
+    /// populated engine is allowed but additive: keys that are not part of this
+    /// graph are left untouched.
     ///
     /// # Errors
-    /// Never fails for a database built by [`DatabaseBuilder`]; the `Result`
-    /// mirrors [`Database::deserialize`].
-    pub fn serialize(&self, out: &mut Vec<u8>) -> Result<(), PersistenceError> {
-        let regions: [(u32, RegionWriter<'_>); 2] = [
-            (TAG_LABELS, &|bytes| self.labels.serialize(bytes)),
-            (TAG_ADJACENCY, &|bytes| self.adjacency.serialize(bytes)),
-        ];
-        write_image(out, &regions)
-    }
+    /// [`LsmError`] if the engine cannot be written, or if a user edge kind
+    /// collides with one of the reserved metadata kinds.
+    pub fn save(&self, engine: &mut Engine) -> Result<(), LsmError> {
+        // Identity first: user key -> dense id.
+        for (user_key, id) in self.labels.iter() {
+            engine.add(Key::new(user_key, LABEL_KIND_ID), id, 0)?;
+        }
 
-    /// Rebuild a database written by [`Database::serialize`].
-    ///
-    /// The envelope is validated first, then each region by its own reader, and
-    /// finally the regions against each other: every id the topology references
-    /// — sources and targets, both directions — must exist in the identity
-    /// layer, so a dangling reference fails the load rather than surfacing later
-    /// as a missing key.
-    ///
-    /// # Errors
-    /// [`PersistenceError`] if the image is truncated or corrupt, if a required
-    /// region is missing, or if it carries an unknown region tag.
-    pub fn deserialize(bytes: &[u8]) -> Result<Self, PersistenceError> {
-        let mut labels: Option<LabelIndex> = None;
-        let mut adjacency: Option<AdjacencyStore> = None;
+        for kind in self.adjacency.kinds() {
+            if kind.0 >= INVERSE_KIND_ID {
+                return Err(LsmError::Corrupt(format!(
+                    "edge kind {} collides with a reserved metadata kind",
+                    kind.0
+                )));
+            }
 
-        for region in read_image(bytes)? {
-            match region.tag {
-                TAG_LABELS => {
-                    labels = Some(region_parse(
-                        region,
-                        "label index",
-                        LabelIndex::deserialize,
-                    )?);
-                }
-                TAG_ADJACENCY => {
-                    adjacency = Some(region_parse(
-                        region,
-                        "adjacency registry",
-                        AdjacencyStore::deserialize,
-                    )?);
-                }
-                tag => return Err(PersistenceError::UnknownRegion { tag }),
+            if self.adjacency.has_inverse(kind) {
+                engine.add(Key::new(u64::from(kind.0), INVERSE_KIND_ID), 1, 0)?;
+            }
+
+            // Parallel edges are distinct rows; the CSR already keeps them in
+            // (source, target) order, so the generated edge ids are stable.
+            let mut next_edge_id: BTreeMap<NodeId, u64> = BTreeMap::new();
+            for (source, target) in self.adjacency.out_edges(kind) {
+                let edge_id = next_edge_id.entry(source).or_insert(0);
+                engine.add(Key::new(source, kind.0), target, *edge_id)?;
+                *edge_id += 1;
             }
         }
 
-        let labels: LabelIndex = labels.ok_or(PersistenceError::Corrupt {
-            reason: "image has no label index region",
-        })?;
-        let adjacency: AdjacencyStore = adjacency.ok_or(PersistenceError::Corrupt {
-            reason: "image has no adjacency region",
-        })?;
+        engine.flush()
+    }
 
-        // Both directions, and targets too: `id_span` is what an identity layer
-        // has to cover, so every reference in the file is bounded here.
+    /// Rebuild a database exported by [`Database::save`].
+    ///
+    /// The label index is rebuilt first, then inverse declarations, then the
+    /// topology. Every id referenced by an edge — source or target — must be
+    /// covered by the label index, so a dangling reference fails the load
+    /// rather than surfacing later as a missing key.
+    ///
+    /// # Errors
+    /// [`LsmError`] if the engine cannot be read, its label ids are not dense,
+    /// or its topology references ids the label index does not know.
+    pub fn load(engine: &Engine) -> Result<Self, LsmError> {
+        // Rebuild dense ids in id order, which is exactly the order
+        // `LabelIndexBuilder` would have assigned on the original build.
+        let mut label_rows = engine.scan_kind(LABEL_KIND_ID)?;
+        label_rows.sort_by_key(|(_, value)| value.target_id);
+        let mut labels = LabelIndexBuilder::new();
+        for (expected, (user_key, value)) in label_rows.iter().enumerate() {
+            let expected = expected as u64;
+            if value.target_id != expected {
+                return Err(LsmError::Corrupt(format!(
+                    "label ids are not dense: expected {expected}, found {}",
+                    value.target_id
+                )));
+            }
+            let assigned = labels.add(*user_key);
+            if assigned != value.target_id {
+                return Err(LsmError::Corrupt(
+                    "label index contains a duplicate user key".into(),
+                ));
+            }
+        }
+
+        let mut adjacency = AdjacencyStoreBuilder::new();
+        for (kind, _) in engine.scan_kind(INVERSE_KIND_ID)? {
+            let kind = u32::try_from(kind)
+                .map_err(|_| LsmError::Corrupt("inverse kind id does not fit u32".into()))?;
+            if kind >= INVERSE_KIND_ID {
+                return Err(LsmError::Corrupt(
+                    "inverse metadata names a reserved kind".into(),
+                ));
+            }
+            adjacency.set_inverse(EdgeKindId(kind));
+        }
+
+        for kind in engine.kinds()? {
+            if kind == LABEL_KIND_ID || kind == INVERSE_KIND_ID {
+                continue;
+            }
+            if kind >= INVERSE_KIND_ID {
+                return Err(LsmError::Corrupt(format!(
+                    "engine contains reserved metadata kind {kind}"
+                )));
+            }
+            for (source, value) in engine.scan_kind(kind)? {
+                adjacency.add_edge(EdgeKindId(kind), source, value.target_id);
+            }
+        }
+
+        let labels: LabelIndex = labels.build();
+        let adjacency: AdjacencyStore = adjacency.build();
+
+        // Every source and target must resolve in the identity layer.
         if adjacency.id_span() > labels.node_count() {
-            return Err(PersistenceError::Corrupt {
-                reason: "adjacency references ids the label index does not know",
-            });
+            return Err(LsmError::Corrupt(
+                "adjacency references ids the label index does not know".into(),
+            ));
         }
 
         Ok(Self { labels, adjacency })
     }
-}
-
-/// Run one region through its own validator, naming the region if it fails.
-fn region_parse<T>(
-    region: Region<'_>,
-    name: &'static str,
-    parse: fn(&[u8]) -> Result<T, PersistenceError>,
-) -> Result<T, PersistenceError> {
-    parse(region.bytes).map_err(|source| PersistenceError::Nested {
-        context: name.to_string(),
-        source: Box::new(source),
-    })
 }
 
 /// Assemble a database from keys and key-to-key edges.
@@ -165,10 +211,33 @@ impl DatabaseBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::ENTRY_LEN;
-    use grahh_persist::HEADER_LEN;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     const FOLLOWS: EdgeKindId = EdgeKindId(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("grahh-db-test-{}-{id}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// Keys 100/200/300, with 100 -> {200, 300} and 200 -> 300.
     fn small_graph() -> Database {
@@ -180,18 +249,22 @@ mod tests {
         b.build()
     }
 
-    /// The minimum query: key -> id -> expand -> keys, through bytes.
-    #[test]
-    fn lookup_then_expand_survives_a_round_trip() {
-        let db: Database = small_graph();
+    fn round_trip(db: &Database) -> Database {
+        let dir = TempDir::new();
+        let mut engine = Engine::open(&dir.0).unwrap();
+        db.save(&mut engine).unwrap();
+        drop(engine);
+        let engine = Engine::open(&dir.0).unwrap();
+        Database::load(&engine).unwrap()
+    }
 
-        let mut bytes: Vec<u8> = Vec::new();
-        db.serialize(&mut bytes).unwrap();
-        let db: Database = Database::deserialize(&bytes).unwrap();
+    #[test]
+    fn lookup_then_expand_survives_an_lsm_round_trip() {
+        let db = round_trip(&small_graph());
 
         assert_eq!(db.node_count(), 3);
         // Three forward edges plus three reverse ones: `FOLLOWS` declares an
-        // inverse, so both directions are stored.
+        // inverse, so both directions are stored in the in-memory registry.
         assert_eq!(db.edge_count(), 6);
 
         let key_of = |node: NodeId| db.key_of(node).expect("ids resolve back to keys");
@@ -210,141 +283,48 @@ mod tests {
     }
 
     #[test]
-    fn serialization_is_byte_for_byte_stable() {
-        let db: Database = small_graph();
-
-        let mut first: Vec<u8> = Vec::new();
-        db.serialize(&mut first).unwrap();
-        let back: Database = Database::deserialize(&first).unwrap();
-
-        let mut second: Vec<u8> = Vec::new();
-        back.serialize(&mut second).unwrap();
-        assert_eq!(first, second);
-    }
-
-    #[test]
     fn empty_database_round_trips() {
-        let db: Database = DatabaseBuilder::new().build();
-
-        let mut bytes: Vec<u8> = Vec::new();
-        db.serialize(&mut bytes).unwrap();
-        let back: Database = Database::deserialize(&bytes).unwrap();
-
-        assert_eq!(back.node_count(), 0);
-        assert_eq!(back.edge_count(), 0);
-        assert_eq!(back.lookup(1), None);
+        let db = round_trip(&DatabaseBuilder::new().build());
+        assert_eq!(db.node_count(), 0);
+        assert_eq!(db.edge_count(), 0);
+        assert_eq!(db.lookup(1), None);
     }
 
     #[test]
-    fn image_rejects_unknown_regions() {
-        let mut image: Vec<u8> = Vec::new();
-        let regions: [(u32, RegionWriter<'_>); 1] = [(99, &|bytes| {
-            bytes.push(0);
-            Ok(())
-        })];
-        write_image(&mut image, &regions).unwrap();
-
-        assert!(matches!(
-            Database::deserialize(&image),
-            Err(PersistenceError::UnknownRegion { tag: 99 })
-        ));
+    fn inverse_declarations_survive() {
+        let db = round_trip(&small_graph());
+        assert_eq!(
+            db.expand(db.lookup(300).unwrap(), FOLLOWS, Direction::Incoming),
+            vec![db.lookup(100).unwrap(), db.lookup(200).unwrap()]
+        );
     }
 
     #[test]
-    fn image_rejects_missing_regions() {
-        let mut labels: Vec<u8> = Vec::new();
-        let mut b = LabelIndexBuilder::new();
-        b.add(7);
-        b.build().serialize(&mut labels).unwrap();
-
-        let mut image: Vec<u8> = Vec::new();
-        let regions: [(u32, RegionWriter<'_>); 1] = [(TAG_LABELS, &|bytes| {
-            bytes.extend_from_slice(&labels);
-            Ok(())
-        })];
-        write_image(&mut image, &regions).unwrap();
-
-        assert!(matches!(
-            Database::deserialize(&image),
-            Err(PersistenceError::Corrupt { .. })
-        ));
-    }
-
-    #[test]
-    fn image_rejects_topology_that_outruns_the_label_index() {
-        let mut labels: Vec<u8> = Vec::new();
-        let mut b = LabelIndexBuilder::new();
-        b.add(7);
-        b.build().serialize(&mut labels).unwrap();
-
-        let mut registry: Vec<u8> = Vec::new();
-        let mut adjacency = AdjacencyStoreBuilder::new();
-        // A source id past the end of the identity layer.
-        adjacency.add_edge(FOLLOWS, 5, 0);
-        adjacency.build().serialize(&mut registry).unwrap();
-
-        let mut image: Vec<u8> = Vec::new();
-        let regions: [(u32, RegionWriter<'_>); 2] = [
-            (TAG_LABELS, &|bytes| {
-                bytes.extend_from_slice(&labels);
-                Ok(())
-            }),
-            (TAG_ADJACENCY, &|bytes| {
-                bytes.extend_from_slice(&registry);
-                Ok(())
-            }),
-        ];
-        write_image(&mut image, &regions).unwrap();
-
-        assert!(matches!(
-            Database::deserialize(&image),
-            Err(PersistenceError::Corrupt { .. })
-        ));
-    }
-
-    #[test]
-    fn image_rejects_a_target_only_id() {
-        // The store's own span comes from source ids, so a target reaching past
-        // the identity layer can only be caught by the reference check.
-        let mut labels: Vec<u8> = Vec::new();
-        let mut keys = LabelIndexBuilder::new();
-        keys.add(7);
-        keys.build().serialize(&mut labels).unwrap();
-
-        let mut registry: Vec<u8> = Vec::new();
-        let mut adjacency = AdjacencyStoreBuilder::new();
-        adjacency.add_edge(FOLLOWS, 0, 7); // source 0 is known, target 7 is not
-        adjacency.build().serialize(&mut registry).unwrap();
-
-        let mut image: Vec<u8> = Vec::new();
-        let regions: [(u32, RegionWriter<'_>); 2] = [
-            (TAG_LABELS, &|bytes| {
-                bytes.extend_from_slice(&labels);
-                Ok(())
-            }),
-            (TAG_ADJACENCY, &|bytes| {
-                bytes.extend_from_slice(&registry);
-                Ok(())
-            }),
-        ];
-        write_image(&mut image, &regions).unwrap();
-
-        assert!(matches!(
-            Database::deserialize(&image),
-            Err(PersistenceError::Corrupt { .. })
-        ));
-    }
-
-    #[test]
-    fn an_id_no_edge_touches_is_not_addressable_yet() {
-        // Known limit: a store's span comes from the ids it stores, so an id
-        // with no edges is out of range for `expand` until chunking is sized by
-        // the identity layer instead. The label index still knows it, and the
-        // reference check at load still bounds every id that *is* referenced.
+    fn multiple_kinds_and_parallel_edges_survive() {
+        const LIKES: EdgeKindId = EdgeKindId(1);
         let mut b = DatabaseBuilder::new();
-        b.edge(FOLLOWS, 100, 200); // ids 0 and 1
-        b.node(300); // id 2, no edges
-        let db: Database = b.build();
+        b.edge(FOLLOWS, 1, 2);
+        b.edge(FOLLOWS, 1, 3);
+        b.edge(LIKES, 1, 2);
+        b.edge(LIKES, 1, 2); // parallel edge
+        let db = round_trip(&b.build());
+
+        assert_eq!(
+            db.expand(db.lookup(1).unwrap(), LIKES, Direction::Outgoing),
+            vec![db.lookup(2).unwrap(), db.lookup(2).unwrap()]
+        );
+        assert_eq!(
+            db.expand(db.lookup(1).unwrap(), FOLLOWS, Direction::Outgoing),
+            vec![db.lookup(2).unwrap(), db.lookup(3).unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_edges_still_round_trips() {
+        let mut b = DatabaseBuilder::new();
+        b.edge(FOLLOWS, 100, 200);
+        b.node(300);
+        let db = round_trip(&b.build());
 
         assert_eq!(db.node_count(), 3);
         assert_eq!(db.lookup(300), Some(2));
@@ -352,57 +332,28 @@ mod tests {
             db.expand(2, FOLLOWS, Direction::Outgoing),
             Vec::<NodeId>::new()
         );
-
-        let mut bytes: Vec<u8> = Vec::new();
-        db.serialize(&mut bytes).unwrap();
-        let back: Database = Database::deserialize(&bytes).unwrap();
-        assert_eq!(back.lookup(300), Some(2));
-        assert_eq!(back.key_of(2), Some(300));
+        assert_eq!(db.key_of(2), Some(300));
     }
 
     #[test]
-    fn region_failures_name_the_region() {
-        let db: Database = small_graph();
-        let mut bytes: Vec<u8> = Vec::new();
-        db.serialize(&mut bytes).unwrap();
+    fn load_rejects_topology_that_outruns_the_label_index() {
+        let dir = TempDir::new();
+        let mut engine = Engine::open(&dir.0).unwrap();
+        engine.add(Key::new(7, LABEL_KIND_ID), 0, 0).unwrap();
+        // Source 5 is not covered by the single label row.
+        engine.add(Key::new(5, FOLLOWS.0), 0, 0).unwrap();
+        engine.flush().unwrap();
 
-        // The first region starts right after the two-entry directory.
-        let first_region_at: usize = HEADER_LEN + 4 + 2 * ENTRY_LEN;
-        bytes[first_region_at] ^= 0xFF; // breaks its magic
-
-        match Database::deserialize(&bytes) {
-            Err(PersistenceError::Nested { context, .. }) => assert_eq!(context, "label index"),
-            other => panic!("expected a nested error, got {other:?}"),
-        }
+        assert!(matches!(Database::load(&engine), Err(LsmError::Corrupt(_))));
     }
 
     #[test]
-    fn image_rejects_a_directory_that_does_not_cover_the_buffer() {
-        let db: Database = small_graph();
-        let mut bytes: Vec<u8> = Vec::new();
-        db.serialize(&mut bytes).unwrap();
-
-        // First entry's offset field: header + region count + tag.
-        let offset_at: usize = HEADER_LEN + 4 + 4;
-
-        let mut gap: Vec<u8> = bytes.clone();
-        gap[offset_at..offset_at + 8].copy_from_slice(&0_u64.to_le_bytes());
-        assert!(matches!(
-            Database::deserialize(&gap),
-            Err(PersistenceError::Corrupt { .. })
-        ));
-
-        let truncated: &[u8] = &bytes[..bytes.len() - 1];
-        assert!(matches!(
-            Database::deserialize(truncated),
-            Err(PersistenceError::Corrupt { .. })
-        ));
-
-        let mut extra: Vec<u8> = bytes.clone();
-        extra.push(0);
-        assert!(matches!(
-            Database::deserialize(&extra),
-            Err(PersistenceError::TrailingBytes { .. })
-        ));
+    fn save_rejects_reserved_kind_ids() {
+        let dir = TempDir::new();
+        let mut engine = Engine::open(&dir.0).unwrap();
+        let mut b = DatabaseBuilder::new();
+        b.edge(EdgeKindId(INVERSE_KIND_ID), 1, 2);
+        let db = b.build();
+        assert!(matches!(db.save(&mut engine), Err(LsmError::Corrupt(_))));
     }
 }
