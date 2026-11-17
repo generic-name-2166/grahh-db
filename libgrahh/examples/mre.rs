@@ -1,38 +1,24 @@
-//! Minimum end-to-end use of the database API: build by key, persist through
-//! the LSM engine, load, then run the query the engine exists for.
+//! Minimum end-to-end use of the embedded database API.
 //!
 //! ```text
-//! build:  edges are declared by user key; ids are assigned on first sight
-//! save:   label index + per-kind adjacency -> LSM tablets
-//! load:   LSM tablets -> label index + compressed CSR registry
-//! query:  key -> id  (lookup)
-//!         id -> ids  (expand through one edge kind, one direction)
-//!         id -> key  (key_of), or repeat for a nested traversal
+//! open:   Database::open(path)  (SQLite/DuckDB-style connection)
+//! write:  ensure nodes, declare edges/properties; durable via LSMT (WAL)
+//! query:  key -> id (lookup), id -> ids (expand), id -> key (key_of)
+//! reopen: data survives close/reopen
 //! ```
 //!
 //! Run: `cargo run --example mre -p libgrahh`
 
 use std::fs;
 
-use libgrahh::{Database, DatabaseBuilder, Direction, EdgeKindId, Engine, NodeId};
+use libgrahh::{
+    Database, Direction, EdgeKindId, NodeId, PropertyKindId, PropertyType, PropertyValue,
+};
 
-/// `follows` is directional and we want "who follows me", so it declares an
-/// inverse. `likes` does not.
 const FOLLOWS: EdgeKindId = EdgeKindId(0);
 const LIKES: EdgeKindId = EdgeKindId(1);
+const NAME: PropertyKindId = PropertyKindId(10_000);
 
-fn build() -> Database {
-    let mut b = DatabaseBuilder::new();
-    b.set_inverse(FOLLOWS);
-    b.edge(FOLLOWS, 1, 2);
-    b.edge(FOLLOWS, 1, 3);
-    b.edge(FOLLOWS, 2, 3);
-    b.edge(FOLLOWS, 4, 3);
-    b.edge(LIKES, 3, 7);
-    b.build()
-}
-
-/// Expand `node` and translate the result back into user keys.
 fn expand_keys(db: &Database, node: NodeId, kind: EdgeKindId, dir: Direction) -> Vec<u64> {
     db.expand(node, kind, dir)
         .into_iter()
@@ -41,60 +27,61 @@ fn expand_keys(db: &Database, node: NodeId, kind: EdgeKindId, dir: Direction) ->
 }
 
 fn main() {
-    let built: Database = build();
-    println!(
-        "built : {} nodes, {} edges (forward + reverse for inverse kinds)",
-        built.node_count(),
-        built.edge_count()
-    );
-
-    // ---- Persist the whole graph through the LSM engine ----
     let dir = std::env::temp_dir().join(format!("grahh-mre-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    let mut engine = Engine::open(&dir).unwrap();
-    built.save(&mut engine).unwrap();
-    let tablets = engine.tablet_count();
-    drop(engine);
-    println!(
-        "saved : {} LSM tablet(s) for {} nodes",
-        tablets,
-        built.node_count()
-    );
 
-    // ---- Load it back and query only the loaded copy ----
-    let engine = Engine::open(&dir).unwrap();
-    let db: Database = Database::load(&engine).unwrap();
+    {
+        let mut db = Database::open(&dir).unwrap();
+        db.set_inverse(FOLLOWS).unwrap();
+        db.add_edge(FOLLOWS, 1, 2).unwrap();
+        db.add_edge(FOLLOWS, 1, 3).unwrap();
+        db.add_edge(FOLLOWS, 2, 3).unwrap();
+        db.add_edge(FOLLOWS, 4, 3).unwrap();
+        db.add_edge(LIKES, 3, 7).unwrap();
+
+        let alice = db.lookup(1).unwrap();
+        db.set_property(
+            alice,
+            NAME,
+            &PropertyValue::String("alice".into()),
+            &PropertyType::String,
+        )
+        .unwrap();
+
+        println!(
+            "live: {} nodes, {} edge rows",
+            db.node_count(),
+            db.edge_count()
+        );
+        db.flush().unwrap();
+    }
+
+    let db = Database::open(&dir).unwrap();
     println!(
-        "loaded: {} nodes, {} edges\n",
+        "reopened: {} nodes, {} edge rows\n",
         db.node_count(),
         db.edge_count()
     );
 
-    let alice: NodeId = db.lookup(1).expect("key 1 is in the index");
+    let alice: NodeId = db.lookup(1).expect("key 1 exists");
     println!("lookup {:<3} -> node {alice}", 1);
-    println!("lookup {:<3} -> {:?}", 999, db.lookup(999));
-    println!("key_of {:<3} -> {:?}", alice, db.key_of(alice));
+    println!(
+        "name   {:<3} -> {:?}",
+        1,
+        db.get_property_one(alice, NAME, &PropertyType::String).unwrap()
+    );
 
-    let follows: Vec<u64> = expand_keys(&db, alice, FOLLOWS, Direction::Outgoing);
-    println!("\nfollows         {:?}", follows);
+    println!("\nfollows         {:?}", expand_keys(&db, alice, FOLLOWS, Direction::Outgoing));
 
-    let node: NodeId = db.lookup(3).expect("key 3 is in the index");
-    let followed_by: Vec<u64> = expand_keys(&db, node, FOLLOWS, Direction::Incoming);
-    println!("followed by     {followed_by:?} (inverse was declared)");
-
-    let liked_by: Vec<u64> = expand_keys(&db, node, LIKES, Direction::Incoming);
-    println!("liked by        {liked_by:?} (no inverse declared -> nothing stored)");
-
-    // ---- Two hops: the nested traversal, ids throughout ----
-    let mut friends_of_friends: Vec<u64> = Vec::new();
-    for key in &follows {
-        let friend: NodeId = db.lookup(*key).expect("follow targets are known keys");
-        friends_of_friends.extend(expand_keys(&db, friend, FOLLOWS, Direction::Outgoing));
-    }
-    friends_of_friends.sort_unstable();
-    friends_of_friends.dedup();
-    friends_of_friends.retain(|key| *key != 1);
-    println!("\n2-hop from 1    {friends_of_friends:?}");
+    let node3 = db.lookup(3).unwrap();
+    println!(
+        "followed by     {:?} (inverse declared)",
+        expand_keys(&db, node3, FOLLOWS, Direction::Incoming)
+    );
+    println!(
+        "liked by        {:?} (no inverse -> empty)",
+        expand_keys(&db, node3, LIKES, Direction::Incoming)
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

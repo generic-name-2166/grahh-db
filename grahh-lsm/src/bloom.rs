@@ -8,11 +8,10 @@
 //! splitmix64-derived step, and `hash_count` probes. It is deterministic across
 //! processes and platforms.
 
-use grahh_persist::{Reader, Writer};
-
 use crate::{
     error::{LsmError, Result},
     key::Key,
+    persist::{Reader, Writer},
 };
 
 /// Target bits per key. 10 bits/key is the usual space/accuracy sweet spot.

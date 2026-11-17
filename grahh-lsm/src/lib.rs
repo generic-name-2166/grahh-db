@@ -20,6 +20,7 @@ mod key;
 mod levels;
 mod manifest;
 mod memtable;
+pub mod persist;
 mod tablet;
 mod wal;
 

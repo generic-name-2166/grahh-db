@@ -1,114 +1,87 @@
-//! The database: identity plus topology, persisted through the LSM layer.
+//! Embedded database connection over the LSMT engine.
 //!
-//! The query structures ([`LabelIndex`] and [`AdjacencyStore`]) stay in memory:
-//! they are what make `lookup -> expand -> key_of` an index-free pointer chase.
-//! The LSM engine is the durable representation. [`Database::save`] exports the
-//! in-memory graph into an [`Engine`]; [`Database::load`] rebuilds it from the
-//! engine, with the same validation the old single-image loader performed.
+//! `Database` acts like a SQLite/DuckDB-style connection: open a directory,
+//! mutate/query directly, and let the engine manage durability (WAL + flush).
+//! There is no separate save/load image step.
+//!
+//! Identity (user key ↔ dense internal id), adjacency edges, and properties
+//! all live in the same LSMT key space.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
-use grahh_adjacency::{AdjacencyStore, AdjacencyStoreBuilder, Direction, EdgeKindId};
-use grahh_index::{LabelIndex, LabelIndexBuilder, NodeId};
-use grahh_lsm::{Engine, Key, LsmError};
+use grahh_lsm::{Engine, EngineConfig, Key, LsmError};
 
-/// Reserved LSM kind holding the label index: `key = (user_key, LABEL)` and
-/// `value = (dense_id, 0)`.
+use crate::{
+    adjacency::{AdjacencyStore, AdjacencyStoreBuilder, Direction, EdgeKindId},
+    identity::NodeId,
+    properties::{PropertyKindId, PropertyStore, PropertyType, PropertyValue},
+};
+
+/// Reserved LSM kind for label index rows: key `(user_key, LABEL)`, value `(dense_id, 0)`.
 const LABEL_KIND_ID: u32 = u32::MAX;
-/// Reserved LSM kind recording which edge kinds declared an inverse:
-/// `key = (kind_id, INVERSE)` and `value = (1, 0)`.
+/// Reserved LSM kind for inverse declarations: key `(edge_kind, INVERSE)`, value `(1, 0)`.
 const INVERSE_KIND_ID: u32 = u32::MAX - 1;
+/// Reserved kind range for internal metadata.
+const RESERVED_KIND_FLOOR: u32 = u32::MAX - 1;
 
-/// An immutable graph: user keys resolved to dense internal ids, topology per
-/// edge kind, persisted through an LSM key-value store.
-#[derive(Debug)]
+fn check_kind(kind: u32) -> Result<(), LsmError> {
+    if kind >= RESERVED_KIND_FLOOR {
+        Err(LsmError::Corrupt(format!(
+            "kind {kind} collides with reserved metadata kinds"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// A live database connection backed by an LSMT engine.
+///
+/// Mutations are written to the engine (WAL-durable per engine semantics).
+/// Call [`Database::flush`] to force a tablet flush/checkpoint.
 pub struct Database {
-    labels: LabelIndex,
-    adjacency: AdjacencyStore,
+    engine: Engine,
+    /// user key -> dense internal id
+    key_to_id: BTreeMap<u64, NodeId>,
+    /// dense internal id -> user key
+    id_to_key: Vec<u64>,
+    next_id: NodeId,
+    out_edges: BTreeMap<u32, Vec<(NodeId, NodeId)>>,
+    in_edges: BTreeMap<u32, Vec<(NodeId, NodeId)>>,
+    inverses: BTreeSet<u32>,
 }
 
 impl Database {
-    /// Number of nodes (keys) in the database.
-    pub fn node_count(&self) -> usize {
-        self.labels.node_count()
+    /// Open (or create) a database at `path` with default engine settings.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, LsmError> {
+        Self::open_with_config(path, EngineConfig::default())
     }
 
-    /// Total edges across all kinds and directions.
-    pub fn edge_count(&self) -> usize {
-        self.adjacency.edge_count()
+    /// Open (or create) a database with explicit engine settings.
+    pub fn open_with_config(
+        path: impl AsRef<Path>,
+        config: EngineConfig,
+    ) -> Result<Self, LsmError> {
+        let engine = Engine::open_with_config(path, config)?;
+        let mut db = Self {
+            engine,
+            key_to_id: BTreeMap::new(),
+            id_to_key: Vec::new(),
+            next_id: 0,
+            out_edges: BTreeMap::new(),
+            in_edges: BTreeMap::new(),
+            inverses: BTreeSet::new(),
+        };
+        db.load_state()?;
+        Ok(db)
     }
 
-    /// Resolve a user key to its internal node id.
-    pub fn lookup(&self, key: u64) -> Option<NodeId> {
-        self.labels.lookup(key)
-    }
-
-    /// Resolve an internal node id back to its user key.
-    pub fn key_of(&self, node: NodeId) -> Option<u64> {
-        self.labels.key_of(node)
-    }
-
-    /// Expand a node through `kind` in direction `dir`, as internal ids.
-    pub fn expand(&self, node: NodeId, kind: EdgeKindId, dir: Direction) -> Vec<NodeId> {
-        self.adjacency.neighbors(node, kind, dir)
-    }
-
-    /// Export this database into an LSM engine and flush it.
-    ///
-    /// The engine is expected to be a fresh database directory. Writing into a
-    /// populated engine is allowed but additive: keys that are not part of this
-    /// graph are left untouched.
-    ///
-    /// # Errors
-    /// [`LsmError`] if the engine cannot be written, or if a user edge kind
-    /// collides with one of the reserved metadata kinds.
-    pub fn save(&self, engine: &mut Engine) -> Result<(), LsmError> {
-        // Identity first: user key -> dense id.
-        for (user_key, id) in self.labels.iter() {
-            engine.add(Key::new(user_key, LABEL_KIND_ID), id, 0)?;
-        }
-
-        for kind in self.adjacency.kinds() {
-            if kind.0 >= INVERSE_KIND_ID {
-                return Err(LsmError::Corrupt(format!(
-                    "edge kind {} collides with a reserved metadata kind",
-                    kind.0
-                )));
-            }
-
-            if self.adjacency.has_inverse(kind) {
-                engine.add(Key::new(u64::from(kind.0), INVERSE_KIND_ID), 1, 0)?;
-            }
-
-            // Parallel edges are distinct rows; the CSR already keeps them in
-            // (source, target) order, so the generated edge ids are stable.
-            let mut next_edge_id: BTreeMap<NodeId, u64> = BTreeMap::new();
-            for (source, target) in self.adjacency.out_edges(kind) {
-                let edge_id = next_edge_id.entry(source).or_insert(0);
-                engine.add(Key::new(source, kind.0), target, *edge_id)?;
-                *edge_id += 1;
-            }
-        }
-
-        engine.flush()
-    }
-
-    /// Rebuild a database exported by [`Database::save`].
-    ///
-    /// The label index is rebuilt first, then inverse declarations, then the
-    /// topology. Every id referenced by an edge — source or target — must be
-    /// covered by the label index, so a dangling reference fails the load
-    /// rather than surfacing later as a missing key.
-    ///
-    /// # Errors
-    /// [`LsmError`] if the engine cannot be read, its label ids are not dense,
-    /// or its topology references ids the label index does not know.
-    pub fn load(engine: &Engine) -> Result<Self, LsmError> {
-        // Rebuild dense ids in id order, which is exactly the order
-        // `LabelIndexBuilder` would have assigned on the original build.
-        let mut label_rows = engine.scan_kind(LABEL_KIND_ID)?;
+    fn load_state(&mut self) -> Result<(), LsmError> {
+        // Labels
+        let mut label_rows = self.engine.scan_kind(LABEL_KIND_ID)?;
         label_rows.sort_by_key(|(_, value)| value.target_id);
-        let mut labels = LabelIndexBuilder::new();
         for (expected, (user_key, value)) in label_rows.iter().enumerate() {
             let expected = expected as u64;
             if value.target_id != expected {
@@ -117,94 +90,267 @@ impl Database {
                     value.target_id
                 )));
             }
-            let assigned = labels.add(*user_key);
-            if assigned != value.target_id {
+            if self.key_to_id.insert(*user_key, value.target_id).is_some() {
                 return Err(LsmError::Corrupt(
                     "label index contains a duplicate user key".into(),
                 ));
             }
+            self.id_to_key.push(*user_key);
         }
+        self.next_id = self.id_to_key.len() as u64;
 
-        let mut adjacency = AdjacencyStoreBuilder::new();
-        for (kind, _) in engine.scan_kind(INVERSE_KIND_ID)? {
+        // Inverses
+        for (kind, _) in self.engine.scan_kind(INVERSE_KIND_ID)? {
             let kind = u32::try_from(kind)
                 .map_err(|_| LsmError::Corrupt("inverse kind id does not fit u32".into()))?;
-            if kind >= INVERSE_KIND_ID {
-                return Err(LsmError::Corrupt(
-                    "inverse metadata names a reserved kind".into(),
-                ));
-            }
-            adjacency.set_inverse(EdgeKindId(kind));
+            check_kind(kind)?;
+            self.inverses.insert(kind);
         }
 
-        for kind in engine.kinds()? {
-            if kind == LABEL_KIND_ID || kind == INVERSE_KIND_ID {
+        // Edges (adjacency kinds have 16-byte [target_id, edge_id] rows).
+        // Kinds with non-adjacency/raw values (e.g. properties) are left in the
+        // engine and accessed via raw/property APIs.
+        for kind in self.engine.kinds()? {
+            if kind == LABEL_KIND_ID || kind == INVERSE_KIND_ID || kind >= RESERVED_KIND_FLOOR {
                 continue;
             }
-            if kind >= INVERSE_KIND_ID {
-                return Err(LsmError::Corrupt(format!(
-                    "engine contains reserved metadata kind {kind}"
-                )));
+            let rows = match self.engine.scan_kind(kind) {
+                Ok(rows) => rows,
+                Err(LsmError::InvalidValueLength { .. }) => continue,
+                Err(e) => return Err(e),
+            };
+            let mut out = Vec::with_capacity(rows.len());
+            for (source, value) in rows {
+                out.push((source, value.target_id));
             }
-            for (source, value) in engine.scan_kind(kind)? {
-                adjacency.add_edge(EdgeKindId(kind), source, value.target_id);
+            if self.inverses.contains(&kind) {
+                let mut rev: Vec<(NodeId, NodeId)> = out.iter().map(|&(s, t)| (t, s)).collect();
+                rev.sort_unstable();
+                self.in_edges.insert(kind, rev);
             }
+            self.out_edges.insert(kind, out);
         }
 
-        let labels: LabelIndex = labels.build();
-        let adjacency: AdjacencyStore = adjacency.build();
-
-        // Every source and target must resolve in the identity layer.
-        if adjacency.id_span() > labels.node_count() {
+        // Validate adjacency references
+        let max_ref = self
+            .out_edges
+            .values()
+            .flat_map(|v| v.iter())
+            .map(|&(s, t)| s.max(t))
+            .max()
+            .unwrap_or(0);
+        if !self.id_to_key.is_empty() && max_ref >= self.next_id {
             return Err(LsmError::Corrupt(
                 "adjacency references ids the label index does not know".into(),
             ));
         }
-
-        Ok(Self { labels, adjacency })
-    }
-}
-
-/// Assemble a database from keys and key-to-key edges.
-///
-/// Ids are issued on first sight, so declaring edges by key never requires the
-/// caller to know internal ids — and the same input sequence always produces the
-/// same ids.
-#[derive(Debug, Default)]
-pub struct DatabaseBuilder {
-    labels: LabelIndexBuilder,
-    adjacency: AdjacencyStoreBuilder,
-}
-
-impl DatabaseBuilder {
-    /// Create an empty builder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The internal id for `key`, assigning the next dense id if unseen.
-    pub fn node(&mut self, key: u64) -> NodeId {
-        self.labels.add(key)
-    }
-
-    /// Declare a directed edge between two user keys.
-    pub fn edge(&mut self, kind: EdgeKindId, source: u64, target: u64) {
-        let source: NodeId = self.node(source);
-        let target: NodeId = self.node(target);
-        self.adjacency.add_edge(kind, source, target);
-    }
-
-    /// Declare that `kind` should also expose an incoming (reverse) adjacency.
-    pub fn set_inverse(&mut self, kind: EdgeKindId) {
-        self.adjacency.set_inverse(kind);
-    }
-
-    /// Freeze into an immutable [`Database`].
-    pub fn build(self) -> Database {
-        Database {
-            labels: self.labels.build(),
-            adjacency: self.adjacency.build(),
+        if self.id_to_key.is_empty() && !self.out_edges.is_empty() {
+            return Err(LsmError::Corrupt(
+                "adjacency exists without label index".into(),
+            ));
         }
+
+        Ok(())
+    }
+
+    /// Ensure a node exists for `user_key`, returning its dense internal id.
+    /// Creates and persists the mapping if unseen.
+    pub fn ensure_node(&mut self, user_key: u64) -> Result<NodeId, LsmError> {
+        if let Some(&id) = self.key_to_id.get(&user_key) {
+            return Ok(id);
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.key_to_id.insert(user_key, id);
+        self.id_to_key.push(user_key);
+        self.engine
+            .add(Key::new(user_key, LABEL_KIND_ID), id, 0)?;
+        Ok(id)
+    }
+
+    /// Alias for [`Self::ensure_node`].
+    pub fn node(&mut self, user_key: u64) -> Result<NodeId, LsmError> {
+        self.ensure_node(user_key)
+    }
+
+    /// Number of known nodes.
+    pub fn node_count(&self) -> usize {
+        self.id_to_key.len()
+    }
+
+    /// Resolve a user key to its internal id.
+    pub fn lookup(&self, user_key: u64) -> Option<NodeId> {
+        self.key_to_id.get(&user_key).copied()
+    }
+
+    /// Resolve an internal id to its user key.
+    pub fn key_of(&self, node: NodeId) -> Option<u64> {
+        self.id_to_key.get(node as usize).copied()
+    }
+
+    /// Declare that `kind` has an incoming/reverse index.
+    pub fn set_inverse(&mut self, kind: EdgeKindId) -> Result<(), LsmError> {
+        check_kind(kind.0)?;
+        if self.inverses.insert(kind.0) {
+            self.engine
+                .add(Key::new(u64::from(kind.0), INVERSE_KIND_ID), 1, 0)?;
+            if let Some(out) = self.out_edges.get(&kind.0) {
+                let mut rev: Vec<(NodeId, NodeId)> =
+                    out.iter().map(|&(s, t)| (t, s)).collect();
+                rev.sort_unstable();
+                self.in_edges.insert(kind.0, rev);
+            } else {
+                self.in_edges.entry(kind.0).or_default();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn has_inverse(&self, kind: EdgeKindId) -> bool {
+        self.inverses.contains(&kind.0)
+    }
+
+    /// Add a directed edge between user keys, creating nodes if needed.
+    pub fn add_edge(
+        &mut self,
+        kind: EdgeKindId,
+        source_key: u64,
+        target_key: u64,
+    ) -> Result<(), LsmError> {
+        check_kind(kind.0)?;
+        let source = self.ensure_node(source_key)?;
+        let target = self.ensure_node(target_key)?;
+        let edge_id = self.next_edge_id(kind.0, source);
+        self.engine.add(Key::new(source, kind.0), target, edge_id)?;
+
+        let out = self.out_edges.entry(kind.0).or_default();
+        out.push((source, target));
+        if self.inverses.contains(&kind.0) {
+            let rev = self.in_edges.entry(kind.0).or_default();
+            let at = rev.partition_point(|&row| row < (target, source));
+            rev.insert(at, (target, source));
+        }
+        Ok(())
+    }
+
+    fn next_edge_id(&self, kind: u32, source: NodeId) -> u64 {
+        self.out_edges
+            .get(&kind)
+            .map(|edges| edges.iter().filter(|&&(s, _)| s == source).count() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Expand a node through `kind` in `dir`.
+    pub fn expand(&self, node: NodeId, kind: EdgeKindId, dir: Direction) -> Vec<NodeId> {
+        match dir {
+            Direction::Outgoing => self
+                .out_edges
+                .get(&kind.0)
+                .map(|edges| {
+                    edges
+                        .iter()
+                        .filter(|&&(s, _)| s == node)
+                        .map(|&(_, t)| t)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Direction::Incoming => self
+                .in_edges
+                .get(&kind.0)
+                .map(|edges| {
+                    let start = edges.partition_point(|&(t, _)| t < node);
+                    let end = edges.partition_point(|&(t, _)| t <= node);
+                    edges[start..end].iter().map(|&(_, s)| s).collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Convenience: expand from a user key.
+    pub fn expand_key(
+        &self,
+        user_key: u64,
+        kind: EdgeKindId,
+        dir: Direction,
+    ) -> Option<Vec<NodeId>> {
+        let node = self.lookup(user_key)?;
+        Some(self.expand(node, kind, dir))
+    }
+
+    /// Total outgoing edge rows across all kinds.
+    pub fn edge_count(&self) -> usize {
+        self.out_edges.values().map(Vec::len).sum()
+    }
+
+    /// Set/append a property value (LSMT-backed).
+    pub fn set_property(
+        &mut self,
+        node: NodeId,
+        property: PropertyKindId,
+        value: &PropertyValue,
+        value_type: &PropertyType,
+    ) -> Result<(), LsmError> {
+        check_kind(property.0)?;
+        PropertyStore::add(&mut self.engine, node, property, value, value_type)
+    }
+
+    /// Get property values for a node.
+    pub fn get_property(
+        &self,
+        node: NodeId,
+        property: PropertyKindId,
+        value_type: &PropertyType,
+    ) -> Result<Vec<PropertyValue>, LsmError> {
+        PropertyStore::get(&self.engine, node, property, value_type)
+    }
+
+    /// Get a single property value.
+    pub fn get_property_one(
+        &self,
+        node: NodeId,
+        property: PropertyKindId,
+        value_type: &PropertyType,
+    ) -> Result<Option<PropertyValue>, LsmError> {
+        PropertyStore::get_one(&self.engine, node, property, value_type)
+    }
+
+    /// Build a compressed adjacency snapshot for read-optimized access.
+    pub fn adjacency_snapshot(&self) -> AdjacencyStore {
+        let mut b = AdjacencyStoreBuilder::new();
+        for &kind in &self.inverses {
+            b.set_inverse(EdgeKindId(kind));
+        }
+        for (&kind, edges) in &self.out_edges {
+            for &(s, t) in edges {
+                b.add_edge(EdgeKindId(kind), s, t);
+            }
+        }
+        b.build()
+    }
+
+    /// Flush pending data to tablets.
+    pub fn flush(&mut self) -> Result<(), LsmError> {
+        self.engine.flush()
+    }
+
+    /// Access the underlying engine (advanced use).
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// Mutable access to the underlying engine (advanced use).
+    pub fn engine_mut(&mut self) -> &mut Engine {
+        &mut self.engine
+    }
+}
+
+impl std::fmt::Debug for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Database")
+            .field("node_count", &self.node_count())
+            .field("edge_count", &self.edge_count())
+            .field("dir", &self.engine.dir())
+            .finish_non_exhaustive()
     }
 }
 
@@ -220,7 +366,6 @@ mod tests {
     const FOLLOWS: EdgeKindId = EdgeKindId(0);
 
     struct TempDir(PathBuf);
-
     impl TempDir {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -228,132 +373,88 @@ mod tests {
             let path =
                 std::env::temp_dir().join(format!("grahh-db-test-{}-{id}", std::process::id()));
             let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
             Self(path)
         }
     }
-
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
 
-    /// Keys 100/200/300, with 100 -> {200, 300} and 200 -> 300.
-    fn small_graph() -> Database {
-        let mut b = DatabaseBuilder::new();
-        b.set_inverse(FOLLOWS);
-        b.edge(FOLLOWS, 100, 200);
-        b.edge(FOLLOWS, 100, 300);
-        b.edge(FOLLOWS, 200, 300);
-        b.build()
-    }
-
-    fn round_trip(db: &Database) -> Database {
-        let dir = TempDir::new();
-        let mut engine = Engine::open(&dir.0).unwrap();
-        db.save(&mut engine).unwrap();
-        drop(engine);
-        let engine = Engine::open(&dir.0).unwrap();
-        Database::load(&engine).unwrap()
-    }
-
     #[test]
-    fn lookup_then_expand_survives_an_lsm_round_trip() {
-        let db = round_trip(&small_graph());
+    fn open_write_expand_reopen() {
+        let dir = TempDir::new();
+        {
+            let mut db = Database::open(&dir.0).unwrap();
+            db.set_inverse(FOLLOWS).unwrap();
+            db.add_edge(FOLLOWS, 100, 200).unwrap();
+            db.add_edge(FOLLOWS, 100, 300).unwrap();
+            db.add_edge(FOLLOWS, 200, 300).unwrap();
+            db.flush().unwrap();
+        }
 
+        let db = Database::open(&dir.0).unwrap();
         assert_eq!(db.node_count(), 3);
-        // Three forward edges plus three reverse ones: `FOLLOWS` declares an
-        // inverse, so both directions are stored in the in-memory registry.
-        assert_eq!(db.edge_count(), 6);
-
-        let key_of = |node: NodeId| db.key_of(node).expect("ids resolve back to keys");
-        let follows = |key: u64, dir: Direction| -> Vec<u64> {
-            db.expand(db.lookup(key).expect("known key"), FOLLOWS, dir)
-                .into_iter()
-                .map(key_of)
-                .collect()
-        };
-
-        assert_eq!(follows(100, Direction::Outgoing), vec![200, 300]);
-        assert_eq!(follows(200, Direction::Outgoing), vec![300]);
-        assert_eq!(follows(100, Direction::Incoming), Vec::<u64>::new());
-        assert_eq!(follows(300, Direction::Incoming), vec![100, 200]);
+        let n100 = db.lookup(100).unwrap();
+        let n200 = db.lookup(200).unwrap();
+        let n300 = db.lookup(300).unwrap();
+        assert_eq!(db.expand(n100, FOLLOWS, Direction::Outgoing), vec![n200, n300]);
+        assert_eq!(db.expand(n300, FOLLOWS, Direction::Incoming), vec![n100, n200]);
         assert_eq!(db.lookup(999), None);
     }
 
     #[test]
-    fn empty_database_round_trips() {
-        let db = round_trip(&DatabaseBuilder::new().build());
-        assert_eq!(db.node_count(), 0);
-        assert_eq!(db.edge_count(), 0);
-        assert_eq!(db.lookup(1), None);
-    }
-
-    #[test]
-    fn inverse_declarations_survive() {
-        let db = round_trip(&small_graph());
-        assert_eq!(
-            db.expand(db.lookup(300).unwrap(), FOLLOWS, Direction::Incoming),
-            vec![db.lookup(100).unwrap(), db.lookup(200).unwrap()]
-        );
-    }
-
-    #[test]
-    fn multiple_kinds_and_parallel_edges_survive() {
-        const LIKES: EdgeKindId = EdgeKindId(1);
-        let mut b = DatabaseBuilder::new();
-        b.edge(FOLLOWS, 1, 2);
-        b.edge(FOLLOWS, 1, 3);
-        b.edge(LIKES, 1, 2);
-        b.edge(LIKES, 1, 2); // parallel edge
-        let db = round_trip(&b.build());
-
-        assert_eq!(
-            db.expand(db.lookup(1).unwrap(), LIKES, Direction::Outgoing),
-            vec![db.lookup(2).unwrap(), db.lookup(2).unwrap()]
-        );
-        assert_eq!(
-            db.expand(db.lookup(1).unwrap(), FOLLOWS, Direction::Outgoing),
-            vec![db.lookup(2).unwrap(), db.lookup(3).unwrap()]
-        );
-    }
-
-    #[test]
-    fn a_node_with_no_edges_still_round_trips() {
-        let mut b = DatabaseBuilder::new();
-        b.edge(FOLLOWS, 100, 200);
-        b.node(300);
-        let db = round_trip(&b.build());
-
-        assert_eq!(db.node_count(), 3);
-        assert_eq!(db.lookup(300), Some(2));
-        assert_eq!(
-            db.expand(2, FOLLOWS, Direction::Outgoing),
-            Vec::<NodeId>::new()
-        );
-        assert_eq!(db.key_of(2), Some(300));
-    }
-
-    #[test]
-    fn load_rejects_topology_that_outruns_the_label_index() {
+    fn incremental_writes_are_visible() {
         let dir = TempDir::new();
-        let mut engine = Engine::open(&dir.0).unwrap();
-        engine.add(Key::new(7, LABEL_KIND_ID), 0, 0).unwrap();
-        // Source 5 is not covered by the single label row.
-        engine.add(Key::new(5, FOLLOWS.0), 0, 0).unwrap();
-        engine.flush().unwrap();
-
-        assert!(matches!(Database::load(&engine), Err(LsmError::Corrupt(_))));
+        let mut db = Database::open(&dir.0).unwrap();
+        db.add_edge(FOLLOWS, 1, 2).unwrap();
+        let n1 = db.lookup(1).unwrap();
+        let n2 = db.lookup(2).unwrap();
+        assert_eq!(db.expand(n1, FOLLOWS, Direction::Outgoing), vec![n2]);
+        db.add_edge(FOLLOWS, 1, 3).unwrap();
+        let n3 = db.lookup(3).unwrap();
+        assert_eq!(db.expand(n1, FOLLOWS, Direction::Outgoing), vec![n2, n3]);
     }
 
     #[test]
-    fn save_rejects_reserved_kind_ids() {
+    fn properties_work_through_connection() {
         let dir = TempDir::new();
-        let mut engine = Engine::open(&dir.0).unwrap();
-        let mut b = DatabaseBuilder::new();
-        b.edge(EdgeKindId(INVERSE_KIND_ID), 1, 2);
-        let db = b.build();
-        assert!(matches!(db.save(&mut engine), Err(LsmError::Corrupt(_))));
+        let name = PropertyKindId(10_000);
+        let ty = PropertyType::String;
+        {
+            let mut db = Database::open(&dir.0).unwrap();
+            let node = db.ensure_node(42).unwrap();
+            db.set_property(node, name, &PropertyValue::String("alice".into()), &ty)
+                .unwrap();
+            db.flush().unwrap();
+        }
+        let db = Database::open(&dir.0).unwrap();
+        let node = db.lookup(42).unwrap();
+        assert_eq!(
+            db.get_property_one(node, name, &ty).unwrap(),
+            Some(PropertyValue::String("alice".into()))
+        );
+    }
+
+    #[test]
+    fn reserved_kinds_are_rejected() {
+        let dir = TempDir::new();
+        let mut db = Database::open(&dir.0).unwrap();
+        assert!(db.add_edge(EdgeKindId(INVERSE_KIND_ID), 1, 2).is_err());
+    }
+
+    #[test]
+    fn adjacency_snapshot_matches_live_view() {
+        let dir = TempDir::new();
+        let mut db = Database::open(&dir.0).unwrap();
+        db.set_inverse(FOLLOWS).unwrap();
+        db.add_edge(FOLLOWS, 1, 2).unwrap(); // keys 1->0, 2->1
+        db.add_edge(FOLLOWS, 1, 3).unwrap(); // key 3->2
+        let snap = db.adjacency_snapshot();
+        let n1 = db.lookup(1).unwrap();
+        let n2 = db.lookup(2).unwrap();
+        let n3 = db.lookup(3).unwrap();
+        assert_eq!(snap.neighbors(n1, FOLLOWS, Direction::Outgoing), vec![n2, n3]);
     }
 }

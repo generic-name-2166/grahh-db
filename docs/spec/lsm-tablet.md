@@ -14,7 +14,7 @@ An LSM-tree key-value store where:
 - **No inverse kinds at engine level.** `follows` and `followed_by` are separate user-declared kinds; sync is a schema-level trigger, not engine behavior.
 - **No prefix compression in MVP.** Fixed 12-byte keys make it unnecessary.
 - **Mandatory bloom filters** on every tablet.
-- **Bloom false positives are harmless.** Each tablet also carries an exact per-key length directory. A bloom hit is confirmed against that directory; a key missing from it is a false positive and is skipped. The directory records keys whose list is empty, so a tablet can authoritatively shadow older rows without tombstones. This is a tablet-local stand-in for the schema "length property" until `grahh-properties` exists.
+- **Bloom false positives are harmless.** Each tablet also carries an exact per-key length directory. A bloom hit is confirmed against that directory; a key missing from it is a false positive and is skipped. The directory records keys whose list is empty, so a tablet can authoritatively shadow older rows without tombstones. This is the tablet-local "length property" used by LSMT reads.
 
 ## 2. Data model
 
@@ -24,10 +24,11 @@ Value = [target_id: u64 LE][edge_id: u64 LE]   // 16 bytes for adjacency delta r
                               or serialized bytes for property rows
 ```
 
-> **Current MVP scope:** the engine API is adjacency-specific (`add`, `remove`,
-> `get`, `scan_kind`) and every value is the 16-byte `(target_id, edge_id)`
-> pair. Variable-length property rows reuse the same key space later; the
-> `Cell` enum already carries the cardinality distinction.
+> **Current implementation:** the engine supports adjacency values (`add`/`remove`/
+> `get`/`scan_kind` over 16-byte `[target_id, edge_id]`) and raw variable-length
+> values (`add_raw`/`get_raw`/`scan_kind_raw`) for properties. Both share the
+> same LSMT `(node_id, kind_id)` key space and `Cell` list storage. Adjacency and
+> properties stores are implemented in `libgrahh`.
 
 In memory, a key maps to a cell:
 
@@ -103,7 +104,7 @@ Immutable run file. Rows are **columnar**, partitioned by `kind_id` into chunks.
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | magic `b"GRTB"` |
-| 4 | 4 | version `u32 LE` (= 0) |
+| 4 | 4 | version `u32 LE` (current: 1, blob values) |
 | 8 | 8 | `entry_count` u64 LE — total rows across all chunks |
 | 16 | 4 | `chunk_count` u32 LE — distinct `kind_id`s |
 | 20 | 8 | `min_node` u64 LE |
@@ -140,14 +141,14 @@ One entry per chunk (per distinct `kind_id`):
 
 ### Chunk data
 
-Columnar layout within a chunk:
+Columnar/blob layout within a chunk (tablet v1):
 
-| Column | Encoding |
-|--------|----------|
-| `node_id` | sorted u64 LE, delta + codec |
-| `kind_id` | constant within chunk (stored once in directory) |
-| `target_id` | u64 LE, sorted within `(node_id)` group |
-| `edge_id` | u64 LE, paired with `target_id` |
+| Section | Encoding |
+|---------|----------|
+| `node_id` | length-prefixed codec column of deltas from previous row's node id |
+| `values` | length-prefixed blob column: `row_count` u64, then each row as a length-prefixed raw byte blob |
+
+Rows are ordered by `(node_id, value bytes)`. Adjacency stores 16-byte `[target_id][edge_id]` blobs; properties store typed variable-length blobs. `kind_id` is constant within a chunk (stored in the directory).
 
 ### Footer
 
@@ -219,26 +220,28 @@ With key `(node_id, kind_id)`, outgoing expansion is prefix-efficient. Incoming 
 
 ## 12. Resolved decisions (MVP)
 
-1. **Value width:** fixed 16-byte `(target_id, edge_id)` for adjacency. Variable-length property values come with `grahh-properties`.
+1. **Value width:** raw blob values (tablet v1). Adjacency uses 16-byte `(target_id, edge_id)`; properties use typed variable-length encodings in the same `(node_id, kind_id)`/`Cell` list storage.
 2. **Chunk size target:** not yet chunked by byte size; each `kind_id` is one chunk for now. Byte-sized chunk splitting is a later optimization.
-3. **Random access within a compressed value column:** decode the whole per-kind chunk on access; chunks are small in the MVP.
+3. **Random access within a chunk:** decode the whole per-kind chunk on access; chunks are small in the MVP.
 4. **Bloom filter key:** the full 12-byte `(node_id, kind_id)` key.
 5. **Manifest format:** text, with `max_seq` on `add` lines as the flush commit point.
-6. **Length property:** replaced for now by the tablet-local exact key/length directory. A schema-level `grahh-properties` store can supersede it later without changing read semantics.
+6. **Length property:** provided by the tablet-local exact key/length directory (authoritative, includes empty keys). Schema/catalog layers may add metadata without changing LSMT semantics.
 
 ## 13. Files
 
 | File | Purpose |
 |------|---------|
-| `grahh-lsm/Cargo.toml` | crate manifest |
 | `grahh-lsm/src/lib.rs` | crate root, public API |
+| `grahh-lsm/src/persist.rs` | wire-format primitives (`Reader`/`Writer`, header, `PersistenceError`) |
 | `grahh-lsm/src/error.rs` | `LsmError` |
-| `grahh-lsm/src/key.rs` | fixed-width `Key` / `Value` codecs |
-| `grahh-lsm/src/wal.rs` | WAL append + replay |
+| `grahh-lsm/src/key.rs` | fixed-width `Key`; adjacency `Value` codec |
+| `grahh-lsm/src/wal.rs` | WAL append + replay (raw value blobs) |
 | `grahh-lsm/src/bloom.rs` | bloom filter |
-| `grahh-lsm/src/memtable.rs` | BTreeMap memtable with Cell enum |
-| `grahh-lsm/src/tablet.rs` | columnar tablet writer/reader |
+| `grahh-lsm/src/memtable.rs` | BTreeMap memtable with `Cell` enum |
+| `grahh-lsm/src/tablet.rs` | tablet writer/reader (v1 blob values) |
 | `grahh-lsm/src/manifest.rs` | manifest append-only log |
-| `grahh-lsm/src/levels.rs` | level management (L0, L1, …) |
-| `grahh-lsm/src/engine.rs` | top-level engine (get, put, flush) |
-| `grahh-lsm/tests/` | integration tests |
+| `grahh-lsm/src/levels.rs` | level management + compaction bookkeeping |
+| `grahh-lsm/src/engine.rs` | top-level engine (adjacency + raw/property APIs) |
+| `libgrahh/src/adjacency.rs` | adjacency query structures / LSMT-backed usage |
+| `libgrahh/src/properties.rs` | typed properties on LSMT list/cell storage |
+| `libgrahh/src/database.rs` | embedded connection-style database API |

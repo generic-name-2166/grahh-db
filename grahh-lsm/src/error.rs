@@ -1,13 +1,12 @@
 //! Errors raised by the LSM layer.
 //!
-//! The LSM layer sits on top of [`grahh_persist`] for byte layout, but it also
-//! owns file I/O (WAL, manifest, tablets). This type keeps both kinds of
-//! failure behind one `Result` so callers do not have to know which layer
-//! rejected their bytes.
+//! The layer owns both byte layout (via [`crate::persist`]) and file I/O (WAL,
+//! manifest, tablets). This type keeps both kinds of failure behind one
+//! `Result`.
 
 use std::{error::Error, fmt, io};
 
-use grahh_persist::PersistenceError;
+use crate::persist::PersistenceError;
 
 /// Result alias used throughout `grahh-lsm`.
 pub type Result<T> = std::result::Result<T, LsmError>;

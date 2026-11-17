@@ -5,6 +5,5 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-grahh-persist = { path = "../grahh-persist" }
 grahh-codecs = { path = "../grahh-codecs" }
 crc32fast = "1.4"

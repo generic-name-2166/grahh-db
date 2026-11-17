@@ -1,9 +1,0 @@
-[package]
-name = "grahh-index"
-version = "0.1.0"
-edition.workspace = true
-publish.workspace = true
-
-[dependencies]
-grahh-codecs = { path = "../grahh-codecs" }
-grahh-persist = { path = "../grahh-persist" }

@@ -1,39 +1,41 @@
 //! Immutable columnar run files ("tablets").
 //!
 //! A tablet is partitioned by `kind_id` into compressed chunks. Within a chunk
-//! rows are sorted by `(node_id, target_id)`. Alongside the mandatory bloom
+//! rows are ordered by `(node_id, row order)`. Alongside the mandatory bloom
 //! filter, a tablet carries an exact key/length directory: for every key it
-//! records how many rows belong to it, including zero. That directory is the
-//! local stand-in for the schema's "length property" until `grahh-properties`
-//! exists. It makes a bloom false positive harmless and lets a tablet say
-//! authoritatively "this key is present and empty", which is how removals that
-//! empty a list replace older rows without tombstones.
+//! records how many rows belong to it, including zero. That makes bloom false
+//! positives harmless and lets a tablet say authoritatively "this key is
+//! present and empty" (replace semantics).
 //!
 //! ```text
 //! header (40 bytes)
 //! bloom        : u64 length + bytes
 //! key/length   : u64 length + columns
 //! chunk dir    : chunk_count x [kind u32 | rows u32 | offset u64 | len u64]
-//! chunk data   : per chunk, three length-prefixed codec columns
+//! chunk data   : per chunk: node-delta codec column + value blob column
 //! footer (16)  : header_offset u64 | magic | version
 //! ```
+//!
+//! Values are stored as raw byte blobs, so the same LSMT structure supports
+//! fixed adjacency rows (`[target_id][edge_id]`, 16 bytes) and variable-length
+//! property rows.
 
 use std::collections::BTreeMap;
 
 use grahh_codecs::{Codec, CoreCodec};
-use grahh_persist::{Reader, Writer};
 
 use crate::{
     bloom::BloomFilter,
     error::{LsmError, Result},
     key::{Key, Value},
     memtable::Cell,
+    persist::{Reader, Writer},
 };
 
 /// Magic bytes introducing a tablet.
 pub const TABLET_MAGIC: [u8; 4] = *b"GRTB";
 /// Tablet layout version this build writes.
-pub const TABLET_VERSION: u32 = 0;
+pub const TABLET_VERSION: u32 = 1;
 /// Fixed header width.
 const HEADER_LEN: usize = 40;
 /// Fixed footer width.
@@ -45,29 +47,23 @@ const DIRECTORY_ENTRY_LEN: usize = 24;
 #[derive(Debug, Clone)]
 struct Chunk {
     row_count: u32,
-    /// Three length-prefixed codec columns: node deltas, targets, edge ids.
+    /// node-delta codec column + blob value column.
     packed: Box<[u8]>,
 }
 
 impl Chunk {
-    /// Decode the three columns, reconstructing absolute node ids.
     fn decode(&self, kind_id: u32) -> Result<DecodedChunk> {
         let mut r = Reader::new(&self.packed);
         let node_bytes = r.len_prefixed()?;
-        let target_bytes = r.len_prefixed()?;
-        let edge_bytes = r.len_prefixed()?;
+        let blob_bytes = r.len_prefixed()?;
         r.finish()?;
 
         let deltas = decode_column(node_bytes, "node_id")?;
-        let targets = decode_column(target_bytes, "target_id")?;
-        let edges = decode_column(edge_bytes, "edge_id")?;
         let expected = self.row_count as usize;
-        if deltas.len() != expected || targets.len() != expected || edges.len() != expected {
+        if deltas.len() != expected {
             return Err(LsmError::Corrupt(format!(
-                "kind {kind_id} chunk columns have lengths {}/{}/{}, expected {expected}",
-                deltas.len(),
-                targets.len(),
-                edges.len()
+                "kind {kind_id} node column has {}, expected {expected}",
+                deltas.len()
             )));
         }
 
@@ -80,36 +76,14 @@ impl Chunk {
             node_ids.push(previous);
         }
 
-        // Targets must be sorted within each node group. Chunk boundaries are
-        // not node boundaries, but within one chunk this check is exact.
-        let mut last_target: Option<u64> = None;
-        let mut last_node: Option<u64> = None;
-        for (&node, &target) in node_ids.iter().zip(targets.iter()) {
-            if last_node != Some(node) {
-                last_node = Some(node);
-                last_target = None;
-            }
-            if last_target.is_some_and(|previous| target < previous) {
-                return Err(LsmError::Corrupt(format!(
-                    "kind {kind_id} targets are not sorted within node {node}"
-                )));
-            }
-            last_target = Some(target);
-        }
-
-        Ok(DecodedChunk {
-            node_ids,
-            targets,
-            edges,
-        })
+        let values = decode_blob_column(blob_bytes, expected, kind_id)?;
+        Ok(DecodedChunk { node_ids, values })
     }
 }
 
-/// Decoded columns for one chunk.
 struct DecodedChunk {
     node_ids: Vec<u64>,
-    targets: Vec<u64>,
-    edges: Vec<u64>,
+    values: Vec<Vec<u8>>,
 }
 
 /// An immutable columnar run.
@@ -166,18 +140,16 @@ impl Tablet {
         self.bloom.may_contain(key)
     }
 
-    /// Look up one key.
+    /// Look up one key, returning raw value blobs.
     ///
     /// `None` means this tablet does not contain the key (including a bloom
     /// false positive). `Some(vec![])` means the key is present and
-    /// authoritatively empty. `Some(rows)` means the key is present with
-    /// exactly that many rows.
-    pub fn get(&self, key: Key) -> Result<Option<Vec<Value>>> {
+    /// authoritatively empty.
+    pub fn get_raw(&self, key: Key) -> Result<Option<Vec<Vec<u8>>>> {
         if !self.bloom.may_contain(key) {
             return Ok(None);
         }
         let Some(&length) = self.key_lengths.get(&key) else {
-            // Bloom false positive: the exact directory is the authority.
             return Ok(None);
         };
         if length == 0 {
@@ -201,18 +173,24 @@ impl Tablet {
                 "key {key:?} declares {length} rows but chunk has {found}"
             )));
         }
-
-        Ok(Some(
-            (start..end)
-                .map(|at| Value::new(decoded.targets[at], decoded.edges[at]))
-                .collect(),
-        ))
+        Ok(Some(decoded.values[start..end].to_vec()))
     }
 
-    /// Every key for `kind_id` with its rows, in key order.
+    /// Look up one key as adjacency values (16-byte `[target_id][edge_id]` rows).
     ///
-    /// The chunk is decoded once, unlike calling [`Tablet::get`] for each key.
-    pub fn scan_kind(&self, kind_id: u32) -> Result<Vec<(Key, Vec<Value>)>> {
+    /// Returns `InvalidValueLength` if rows are not adjacency-shaped.
+    pub fn get(&self, key: Key) -> Result<Option<Vec<Value>>> {
+        let Some(rows) = self.get_raw(key)? else {
+            return Ok(None);
+        };
+        rows.into_iter()
+            .map(|bytes| Value::from_bytes(&bytes))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
+    /// Every key for `kind_id` with its raw rows, in key order.
+    pub fn scan_kind_raw(&self, kind_id: u32) -> Result<Vec<(Key, Vec<Vec<u8>>)>> {
         let decoded = self
             .chunks
             .get(&kind_id)
@@ -232,14 +210,12 @@ impl Tablet {
                     let end = row.checked_add(length).ok_or_else(|| {
                         LsmError::Corrupt(format!("kind {kind_id} row count overflows usize"))
                     })?;
-                    if end > decoded.targets.len() {
+                    if end > decoded.values.len() {
                         return Err(LsmError::Corrupt(format!(
                             "key {key:?} declares {length} rows but kind {kind_id} chunk is too short"
                         )));
                     }
-                    for at in row..end {
-                        values.push(Value::new(decoded.targets[at], decoded.edges[at]));
-                    }
+                    values.extend(decoded.values[row..end].iter().cloned());
                     row = end;
                 }
                 None if length > 0 => {
@@ -252,14 +228,28 @@ impl Tablet {
             out.push((key, values));
         }
         if let Some(decoded) = &decoded
-            && row != decoded.targets.len()
+            && row != decoded.values.len()
         {
             return Err(LsmError::Corrupt(format!(
                 "kind {kind_id} chunk has {} rows but its keys declare {row}",
-                decoded.targets.len()
+                decoded.values.len()
             )));
         }
         Ok(out)
+    }
+
+    /// Every key for `kind_id` as adjacency values.
+    pub fn scan_kind(&self, kind_id: u32) -> Result<Vec<(Key, Vec<Value>)>> {
+        self.scan_kind_raw(kind_id)?
+            .into_iter()
+            .map(|(key, rows)| {
+                let values = rows
+                    .into_iter()
+                    .map(|bytes| Value::from_bytes(&bytes))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((key, values))
+            })
+            .collect()
     }
 
     /// Serialize the whole tablet.
@@ -267,7 +257,6 @@ impl Tablet {
         let bloom = self.bloom.serialize();
         let key_section = encode_key_index(&self.key_lengths);
 
-        // Compute the absolute data start and each chunk's offset first.
         let data_start = HEADER_LEN
             + 8
             + bloom.len()
@@ -300,7 +289,7 @@ impl Tablet {
             for chunk in self.chunks.values() {
                 w.bytes(&chunk.packed);
             }
-            w.u64(0); // header_offset: this writer always starts at zero
+            w.u64(0);
             w.bytes(&TABLET_MAGIC);
             w.u32(TABLET_VERSION);
         }
@@ -320,8 +309,9 @@ impl Tablet {
         let mut r = Reader::new(bytes);
         let magic = r.u32()?;
         if magic != u32::from_le_bytes(TABLET_MAGIC) {
-            let found = magic.to_le_bytes();
-            return Err(LsmError::BadMagic { found });
+            return Err(LsmError::BadMagic {
+                found: magic.to_le_bytes(),
+            });
         }
         let version = r.u32()?;
         if version != TABLET_VERSION {
@@ -345,7 +335,6 @@ impl Tablet {
             )));
         }
 
-        // Directory entries.
         if chunk_count > r.remaining() / DIRECTORY_ENTRY_LEN {
             return Err(LsmError::Corrupt(
                 "chunk count exceeds the bytes remaining for its directory".into(),
@@ -360,8 +349,6 @@ impl Tablet {
             entries.push((kind_id, row_count, data_offset, data_length));
         }
 
-        // The directory is contiguous, starts right after itself, and ends at
-        // the footer.
         let data_start = HEADER_LEN
             + 8
             + bloom.serialize().len()
@@ -403,9 +390,6 @@ impl Tablet {
             ));
         }
 
-        // Decode every chunk now: after this returns, reads cannot fail on
-        // structural grounds. Also count rows per key to cross-check the exact
-        // directory.
         let mut chunks = BTreeMap::new();
         let mut counts: BTreeMap<Key, u32> = BTreeMap::new();
         let mut total_rows = 0_u64;
@@ -416,8 +400,7 @@ impl Tablet {
             let chunk = Chunk { row_count, packed };
             let decoded = chunk.decode(kind_id)?;
             for &node_id in &decoded.node_ids {
-                let key = Key::new(node_id, kind_id);
-                *counts.entry(key).or_insert(0) += 1;
+                *counts.entry(Key::new(node_id, kind_id)).or_insert(0) += 1;
             }
             total_rows += u64::from(row_count);
             chunks.insert(kind_id, chunk);
@@ -427,9 +410,6 @@ impl Tablet {
                 "chunk row counts do not sum to the header entry count".into(),
             ));
         }
-
-        // Every key in the exact directory must match the rows actually
-        // present, including keys with zero rows.
         for (&key, &length) in &key_lengths {
             let actual = counts.remove(&key).unwrap_or(0);
             if actual != length {
@@ -473,12 +453,10 @@ pub struct TabletBuilder {
 }
 
 impl TabletBuilder {
-    /// Create an empty builder.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Build directly from an iterator of cells.
     pub fn from_cells(cells: impl IntoIterator<Item = (Key, Cell)>) -> Self {
         let mut builder = Self::new();
         for (key, cell) in cells {
@@ -487,15 +465,12 @@ impl TabletBuilder {
         builder
     }
 
-    /// Insert or replace a cell.
     pub fn insert(&mut self, key: Key, cell: Cell) {
         self.cells.insert(key, cell);
     }
 
-    /// Build the immutable tablet.
     pub fn build(self) -> Result<Tablet> {
-        // Group rows by kind. `Cell` values are the 16-byte adjacency value.
-        let mut rows_by_kind: BTreeMap<u32, Vec<(u64, u64, u64)>> = BTreeMap::new();
+        let mut rows_by_kind: BTreeMap<u32, Vec<(u64, Vec<u8>)>> = BTreeMap::new();
         let mut key_lengths: BTreeMap<Key, u32> = BTreeMap::new();
         let mut entry_count = 0_u64;
 
@@ -506,34 +481,27 @@ impl TabletBuilder {
             key_lengths.insert(*key, length);
             entry_count += u64::from(length);
             for value in cell.iter() {
-                let value = Value::from_bytes(value)?;
-                rows_by_kind.entry(key.kind_id).or_default().push((
-                    key.node_id,
-                    value.target_id,
-                    value.edge_id,
-                ));
+                rows_by_kind
+                    .entry(key.kind_id)
+                    .or_default()
+                    .push((key.node_id, value.to_vec()));
             }
         }
 
         let mut chunks = BTreeMap::new();
         for (kind_id, mut rows) in rows_by_kind {
-            // Rows are sorted by node, then target, then edge id so parallel
-            // edges keep a deterministic order.
-            rows.sort_unstable();
+            rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
             let mut node_ids = Vec::with_capacity(rows.len());
-            let mut targets = Vec::with_capacity(rows.len());
-            let mut edges = Vec::with_capacity(rows.len());
-            for &(node, target, edge) in &rows {
+            let mut values = Vec::with_capacity(rows.len());
+            for (node, value) in rows {
                 node_ids.push(node);
-                targets.push(target);
-                edges.push(edge);
+                values.push(value);
             }
 
-            // Node ids are delta-encoded before the codec sees them.
             let mut deltas = Vec::with_capacity(node_ids.len());
             let mut previous = 0_u64;
             for &node in &node_ids {
-                deltas.push(node - previous);
+                deltas.push(node.saturating_sub(previous));
                 previous = node;
             }
 
@@ -541,11 +509,11 @@ impl TabletBuilder {
             {
                 let mut w = Writer::new(&mut packed);
                 write_column(&mut w, &deltas)?;
-                write_column(&mut w, &targets)?;
-                write_column(&mut w, &edges)?;
+                let blob = encode_blob_column(&values);
+                w.len_prefixed(&blob);
             }
 
-            let row_count = u32::try_from(rows.len())
+            let row_count = u32::try_from(values.len())
                 .map_err(|_| LsmError::Corrupt("chunk has more than u32::MAX rows".into()))?;
             chunks.insert(
                 kind_id,
@@ -557,8 +525,7 @@ impl TabletBuilder {
         }
 
         let bloom = BloomFilter::build(key_lengths.keys());
-        let (min_node, max_node) = match (key_lengths.keys().next(), key_lengths.keys().next_back())
-        {
+        let (min_node, max_node) = match (key_lengths.keys().next(), key_lengths.keys().next_back()) {
             (Some(first), Some(last)) => (first.node_id, last.node_id),
             _ => (0, 0),
         };
@@ -574,14 +541,39 @@ impl TabletBuilder {
     }
 }
 
-/// Encode the exact key/length directory as three codec columns.
+fn encode_blob_column(values: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut w = Writer::new(&mut out);
+    w.u64(values.len() as u64);
+    for value in values {
+        w.len_prefixed(value);
+    }
+    out
+}
+
+fn decode_blob_column(bytes: &[u8], expected: usize, kind_id: u32) -> Result<Vec<Vec<u8>>> {
+    let mut r = Reader::new(bytes);
+    let count = r.len_u64()?;
+    if count != expected {
+        return Err(LsmError::Corrupt(format!(
+            "kind {kind_id} blob column has {count} rows, expected {expected}"
+        )));
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        out.push(r.len_prefixed()?.to_vec());
+    }
+    r.finish()?;
+    Ok(out)
+}
+
 fn encode_key_index(keys: &BTreeMap<Key, u32>) -> Vec<u8> {
     let mut node_deltas = Vec::with_capacity(keys.len());
     let mut kind_ids = Vec::with_capacity(keys.len());
     let mut lengths = Vec::with_capacity(keys.len());
     let mut previous = 0_u64;
     for (&key, &length) in keys {
-        node_deltas.push(key.node_id - previous);
+        node_deltas.push(key.node_id.saturating_sub(previous));
         previous = key.node_id;
         kind_ids.push(u64::from(key.kind_id));
         lengths.push(u64::from(length));
@@ -596,7 +588,6 @@ fn encode_key_index(keys: &BTreeMap<Key, u32>) -> Vec<u8> {
     out
 }
 
-/// Decode the exact key/length directory.
 fn decode_key_index(bytes: &[u8]) -> Result<(BTreeMap<Key, u32>, u64)> {
     let mut r = Reader::new(bytes);
     let count = r.len_u64()?;
@@ -798,7 +789,6 @@ mod tests {
         ));
 
         assert!(Tablet::deserialize(&bytes[..bytes.len() - 1]).is_err());
-
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(Tablet::deserialize(&trailing).is_err());
@@ -806,21 +796,13 @@ mod tests {
 
     #[test]
     fn directory_must_match_rows() {
-        // Hand-build a tablet whose key directory claims one row but whose
-        // chunk has none. Rather than hand-encode every section, build a valid
-        // tablet and corrupt the key-length column by re-serializing a tablet
-        // with a mismatched cell map is not possible; instead flip a directory
-        // row count to zero and confirm rejection.
         let tablet = sample();
         let mut bytes = tablet.serialize();
-        // Directory starts after header + bloom section + key section. Locate
-        // it by walking the lengths we wrote.
         let bloom_len =
             u64::from_le_bytes(bytes[HEADER_LEN..HEADER_LEN + 8].try_into().unwrap()) as usize;
         let key_at = HEADER_LEN + 8 + bloom_len;
         let key_len = u64::from_le_bytes(bytes[key_at..key_at + 8].try_into().unwrap()) as usize;
         let directory_at = key_at + 8 + key_len;
-        // First entry: kind u32, row_count u32. Set row_count to zero.
         bytes[directory_at + 4..directory_at + 8].copy_from_slice(&0_u32.to_le_bytes());
         assert!(Tablet::deserialize(&bytes).is_err());
     }
@@ -830,10 +812,28 @@ mod tests {
         let mut b = TabletBuilder::new();
         b.insert(Key::new(7, 3), Cell::empty_many());
         let tablet = b.build().unwrap();
-        let bytes = tablet.serialize();
-        let back = Tablet::deserialize(&bytes).unwrap();
+        let back = Tablet::deserialize(&tablet.serialize()).unwrap();
         assert_eq!(back.get(Key::new(7, 3)).unwrap(), Some(vec![]));
         assert_eq!(back.entry_count(), 0);
         assert_eq!(back.key_count(), 1);
+    }
+
+    #[test]
+    fn variable_length_property_rows_round_trip() {
+        let mut b = TabletBuilder::new();
+        b.insert(Key::new(1, 100), Cell::One(b"hello".to_vec()));
+        b.insert(
+            Key::new(1, 101),
+            Cell::Many(vec![vec![1, 2, 3], b"world".to_vec()]),
+        );
+        let tablet = Tablet::deserialize(&b.build().unwrap().serialize()).unwrap();
+        assert_eq!(
+            tablet.get_raw(Key::new(1, 100)).unwrap(),
+            Some(vec![b"hello".to_vec()])
+        );
+        assert_eq!(
+            tablet.get_raw(Key::new(1, 101)).unwrap(),
+            Some(vec![vec![1, 2, 3], b"world".to_vec()])
+        );
     }
 }

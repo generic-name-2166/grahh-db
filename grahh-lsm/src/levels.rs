@@ -65,9 +65,22 @@ impl Levels {
         ordered
     }
 
+    /// Tablets in `level`, in insertion order.
+    pub fn files_at(&self, level: u32) -> &[String] {
+        self.levels
+            .get(level as usize)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// Number of tablets across all levels.
     pub fn tablet_count(&self) -> usize {
         self.levels.iter().map(Vec::len).sum()
+    }
+
+    /// Number of tablets in `level`.
+    pub fn len_at(&self, level: u32) -> usize {
+        self.files_at(level).len()
     }
 
     /// Number of levels currently allocated (including empty holes).
